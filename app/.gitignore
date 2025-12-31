@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtualenv
+.venv/
+
+# Local DB / data
+data/*.sqlite3
+data/**/*.sqlite3
+data/import/
+data/**/*.json
+
+# Env secrets
+.env
+.env.*
+
+# OS/editor
+.vscode/
+.DS_Store
