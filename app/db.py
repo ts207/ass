@@ -2,15 +2,165 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+import re
+
+def _fts_query(user_query: str) -> str:
+    """
+    Make a safer FTS5 MATCH query from free text.
+    - splits into tokens
+    - ANDs tokens by default
+    - quotes tokens with special chars
+    """
+    tokens = [t for t in re.split(r"\s+", user_query.strip()) if t]
+    if not tokens:
+        return ""
+    out = []
+    for t in tokens:
+        # Quote tokens with non-word chars or FTS operators to avoid syntax errors.
+        if re.search(r'[^A-Za-z0-9_]', t) or re.search(r'["\*\:\-\(\)\[\]\{\}\^~]', t):
+            t = '"' + t.replace('"', '""') + '"'
+        out.append(t)
+    return " AND ".join(out)
+
+def chatgpt_fts_candidates(conn, query: str, agent: str, limit: int = 100) -> List[Dict[str, Any]]:
+    q = _fts_query(query)
+    if not q:
+        return []
+    rows = conn.execute(
+        """
+        SELECT node_id, conversation_id
+        FROM chatgpt_nodes_fts
+        WHERE chatgpt_nodes_fts MATCH ?
+          AND (agent = ? OR ? = 'general')
+        LIMIT ?
+        """,
+        (q, agent, agent, limit),
+    ).fetchall()
+    return [{"node_id": r[0], "conversation_id": r[1]} for r in rows]
+
+
+def chatgpt_get_embeddings(conn, node_ids: List[str]) -> Dict[str, Any]:
+    """
+    Return {node_id: np.ndarray} for the provided ids where embeddings exist.
+    """
+    import numpy as np
+
+    if not node_ids:
+        return {}
+    placeholders = ",".join(["?"] * len(node_ids))
+    rows = conn.execute(
+        f"""
+        SELECT node_id, dim, vec
+        FROM chatgpt_node_embeddings
+        WHERE node_id IN ({placeholders})
+        """,
+        node_ids,
+    ).fetchall()
+
+    out: Dict[str, Any] = {}
+    for nid, dim, blob in rows:
+        if blob is None:
+            continue
+        arr = np.frombuffer(blob, dtype=np.float32)
+        if dim and arr.size >= dim:
+            arr = arr[:dim]
+        out[nid] = arr
+    return out
+
+def chatgpt_get_node(conn, node_id: str) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        """
+        SELECT node_id, conversation_id, parent_id, role, text, create_time, is_message, main_child_id, agent
+        FROM chatgpt_nodes
+        WHERE node_id = ?
+        """,
+        (node_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "node_id": row[0],
+        "conversation_id": row[1],
+        "parent_id": row[2],
+        "role": row[3],
+        "text": row[4],
+        "create_time": row[5],
+        "is_message": row[6],
+        "main_child_id": row[7],
+        "agent": row[8],
+    }
+
+def chatgpt_get_conversation_title(conn, conversation_id: str) -> str:
+    row = conn.execute(
+        "SELECT title FROM chatgpt_conversations WHERE id = ?",
+        (conversation_id,),
+    ).fetchone()
+    return row[0] if row and row[0] else ""
+
+def chatgpt_context_window(
+    conn,
+    node_id: str,
+    up: int = 6,
+    down: int = 4,
+) -> List[Dict[str, Any]]:
+    """
+    Faithful context:
+    - walk up via parent_id (skip is_message=0)
+    - walk down via main_child_id (skip is_message=0)
+    Returns messages ordered oldest -> newest.
+    """
+    center = chatgpt_get_node(conn, node_id)
+    if not center:
+        return []
+
+    # Walk up (parents)
+    up_nodes: List[Dict[str, Any]] = []
+    cur = center
+    steps = 0
+    while steps < up and cur.get("parent_id"):
+        cur = chatgpt_get_node(conn, cur["parent_id"])
+        if not cur:
+            break
+        if cur["is_message"] == 1 and (cur.get("text") or "").strip():
+            up_nodes.append(cur)
+            steps += 1
+
+    up_nodes.reverse()  # oldest -> newest
+
+    # Center (include even if not message? typically message)
+    mid_nodes: List[Dict[str, Any]] = []
+    if center["is_message"] == 1 and (center.get("text") or "").strip():
+        mid_nodes.append(center)
+
+    # Walk down (mainline children)
+    down_nodes: List[Dict[str, Any]] = []
+    cur = center
+    steps = 0
+    while steps < down and cur.get("main_child_id"):
+        cur = chatgpt_get_node(conn, cur["main_child_id"])
+        if not cur:
+            break
+        if cur["is_message"] == 1 and (cur.get("text") or "").strip():
+            down_nodes.append(cur)
+            steps += 1
+
+    return up_nodes + mid_nodes + down_nodes
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def connect(db_path: Path, *, check_same_thread: bool = True) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, check_same_thread=check_same_thread)
+def connect(db_path: str, *, check_same_thread: bool = False, timeout: float = 30.0) -> sqlite3.Connection:
+    conn = sqlite3.connect(
+        db_path,
+        check_same_thread=check_same_thread,
+        timeout=timeout,
+    )
     conn.row_factory = sqlite3.Row
     return conn
+
+
+
 
 def init_db(conn: sqlite3.Connection, schema_sql: str) -> None:
     conn.executescript(schema_sql)

@@ -67,6 +67,24 @@ def call_tool(name: str, args: Dict[str, Any], *, conn, user_id: str) -> str:
             )
             return json.dumps(out, ensure_ascii=False)
 
+        if name == "memory_search_graph":
+            use_embeddings_val = args.get("use_embeddings", True)
+            if isinstance(use_embeddings_val, str):
+                use_embeddings_flag = use_embeddings_val.lower() != "false"
+            else:
+                use_embeddings_flag = bool(use_embeddings_val)
+            out = t.memory_search_graph_tool(
+                conn,
+                query=args["query"],
+                agent=args["agent"],
+                k=int(args.get("k", 5)),
+                candidate_limit=int(args.get("candidate_limit", 100)),
+                context_up=int(args.get("context_up", 6)),
+                context_down=int(args.get("context_down", 4)),
+                use_embeddings=use_embeddings_flag,
+            )
+            return json.dumps(out, ensure_ascii=False)
+
         raise ToolError(f"Unknown tool: {name}")
 
     except Exception as e:

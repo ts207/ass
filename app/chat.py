@@ -3,8 +3,19 @@ import threading
 from datetime import datetime, timezone
 from openai import OpenAI
 from pathlib import Path
+from dotenv import load_dotenv
+import tiktoken
+import re
+load_dotenv()
 
-from .config import DB_PATH, MODEL, MAX_HISTORY_MESSAGES
+from .config import (
+    DB_PATH,
+    MODEL,
+    MAX_HISTORY_MESSAGES,
+    MODEL_CONTEXT_TOKENS,
+    REQUEST_BUDGET_FRACTION,
+    MEMORY_INJECT_MAX_TOKENS,
+)
 from .db import (
     connect,
     init_db,
@@ -51,6 +62,156 @@ def split_prefixed_requests(s: str):
 def _msg(role: str, text: str):
     # Simple message shape accepted by Responses API for inputs
     return {"role": role, "content": text}
+
+
+def _get_encoding():
+    return tiktoken.get_encoding("cl100k_base")
+
+
+def _count_tokens(messages, enc) -> int:
+    return sum(len(enc.encode(m["role"])) + len(enc.encode(m["content"])) for m in messages)
+
+
+def _fetch_all_messages(conn, convo_id: str):
+    rows = conn.execute(
+        "SELECT id, role, content FROM messages WHERE conversation_id=? ORDER BY created_at ASC",
+        (convo_id,),
+    ).fetchall()
+    return [{"id": r["id"], "role": r["role"], "content": r["content"]} for r in rows]
+
+
+def _summarize_messages(client: OpenAI, model: str, messages):
+    formatted = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
+    prompt = (
+        "Summarize the following conversation into concise bullet points capturing key facts, decisions, "
+        "and follow-ups. Keep it short and information-dense."
+    )
+    resp = client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": formatted},
+        ],
+    )
+    return (resp.output_text or "").strip()
+
+
+def _count_tokens_for_context(messages, system_message: str, enc) -> int:
+    base = [{"role": "system", "content": system_message}]
+    return _count_tokens(base + messages, enc)
+
+
+def _ensure_budget_with_summary(conn, client, model, convo_id: str, system_message: str, budget_tokens: int, enc, user_id: str):
+    messages = _fetch_all_messages(conn, convo_id)
+    while True:
+        total = _count_tokens_for_context(messages, system_message, enc)
+        if total <= budget_tokens:
+            return messages
+        if len(messages) <= 4:
+            return messages
+        chunk = []
+        chunk_tokens = 0
+        target = max(512, budget_tokens // 5)
+        for m in messages:
+            t = len(enc.encode(m["role"])) + len(enc.encode(m["content"]))
+            chunk.append(m)
+            chunk_tokens += t
+            if chunk_tokens >= target:
+                break
+        summary = _summarize_messages(client, model, chunk)
+        if not summary:
+            return messages
+        ids = [m["id"] for m in chunk]
+        conn.execute(
+            f"DELETE FROM messages WHERE id IN ({','.join(['?']*len(ids))})",
+            ids,
+        )
+        add_message(conn, convo_id, "system", f"Conversation summary: {summary}")
+        messages = _fetch_all_messages(conn, convo_id)
+
+
+def _build_context_token_aware(system_message: str, history_messages, new_user_text: str, budget_tokens: int, enc):
+    base = [{"role": "system", "content": system_message}]
+    acc_tokens = _count_tokens(base, enc)
+    user_tokens = len(enc.encode("user")) + len(enc.encode(new_user_text))
+    acc_tokens += user_tokens
+
+    selected = []
+    for m in reversed(history_messages):
+        t = len(enc.encode(m["role"])) + len(enc.encode(m["content"]))
+        if acc_tokens + t > budget_tokens:
+            break
+        selected.append({"role": m["role"], "content": m["content"]})
+        acc_tokens += t
+    selected.reverse()
+    return base + selected + [{"role": "user", "content": new_user_text}]
+
+
+def _truncate_text_to_tokens(text: str, max_tokens: int, enc) -> str:
+    if max_tokens <= 0:
+        return ""
+    toks = enc.encode(text)
+    if len(toks) <= max_tokens:
+        return text
+    return enc.decode(toks[:max_tokens]) + "\n\n[truncated]"
+
+
+def _format_memory_results(results: list[dict], *, max_chars: int = 6000) -> str:
+    parts: list[str] = []
+    for r in results:
+        title = (r.get("title") or "").strip()
+        context = (r.get("context") or "").strip()
+        if not context:
+            continue
+        header = f"Title: {title}" if title else "Title: (untitled)"
+        parts.append(f"{header}\n{context}")
+    blob = "\n\n---\n\n".join(parts).strip()
+    if len(blob) > max_chars:
+        blob = blob[:max_chars].rstrip() + "\n\n[truncated]"
+    return blob
+
+
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "if", "then", "else", "so", "to", "of", "in", "on", "at", "for", "from",
+    "with", "without", "is", "are", "was", "were", "be", "been", "being", "i", "you", "we", "they", "he", "she",
+    "it", "this", "that", "these", "those", "my", "your", "our", "their", "me", "him", "her", "them", "as",
+}
+
+
+def _query_variants(text: str, enc) -> list[str]:
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    variants: list[str] = [raw]
+
+    # Shortened variant (first ~80 tokens) to avoid over-specificity.
+    toks = enc.encode(raw)
+    if len(toks) > 80:
+        variants.append(enc.decode(toks[:80]))
+
+    # Keyword variant for better FTS recall.
+    words = re.findall(r"[A-Za-z0-9_']{3,}", raw.lower())
+    seen: set[str] = set()
+    kept: list[str] = []
+    for w in words:
+        if w in _STOPWORDS:
+            continue
+        if w in seen:
+            continue
+        seen.add(w)
+        kept.append(w)
+        if len(kept) >= 10:
+            break
+    if kept:
+        variants.append(" ".join(kept))
+
+    # Deduplicate while preserving order.
+    out: list[str] = []
+    for v in variants:
+        v = v.strip()
+        if v and v not in out:
+            out.append(v)
+    return out
 
 
 def _parse_args():
@@ -127,6 +288,8 @@ def main():
     debug = args.debug
 
     client = OpenAI()
+    enc = _get_encoding()
+    REQUEST_BUDGET = int(MODEL_CONTEXT_TOKENS * REQUEST_BUDGET_FRACTION)
     user_id = "local_user"
 
     conn = connect(DB_PATH)
@@ -190,28 +353,122 @@ def main():
 
                 tools_schema = LIFE_TOOLS if agent == "life" else DS_TOOLS
                 system_instructions = (
-                    "You are the Life Manager. User timezone: Europe/Stockholm. "
+                    "You are the Life Manager. User timezone: Asia/Ulaanbaatar. "
                     "If you schedule reminders, always output due_at as ISO 8601 with timezone offset."
                     if agent == "life"
                     else
                     "You are a Data Science Course Assistant. You can design short courses, serve lessons, grade submissions, and adapt the plan based on progress."
                 )
 
-                history = get_recent_messages(conn, agent_convo, MAX_HISTORY_MESSAGES)
+                # Auto-retrieve from imported ChatGPT export memory and inject as system context.
+                # This makes memory available even when the model doesn't decide to call the tool.
+                try:
+                    from app.tools import memory_search_graph_tool
 
-                input_items = [_msg("system", system_instructions)]
-                input_items += [_msg(m["role"], m["content"]) for m in history]
-                input_items += [_msg("user", text)]
+                    mem_results: list[dict] = []
+                    seen_nodes: set[str] = set()
+                    variants = _query_variants(text, enc)
+                    agent_tags = [agent, "general"] if agent in ("life", "ds") else ["general"]
 
-                final_text, _ = run_with_tools(
-                    client=client,
-                    model=MODEL,
-                    tools_schema=tools_schema,
-                    input_items=input_items,
-                    conn=conn,
-                    user_id=user_id,
-                    debug=debug,
+                    # Keep this bounded; don't spam the API.
+                    for agent_tag in agent_tags:
+                        for q in variants[:2]:
+                            mem = memory_search_graph_tool(
+                                conn,
+                                query=q,
+                                agent=agent_tag,
+                                k=4,
+                                candidate_limit=200,
+                                context_up=6,
+                                context_down=4,
+                                use_embeddings=True,
+                            )
+                            for r in mem.get("results", []) or []:
+                                nid = r.get("node_id")
+                                if nid and nid not in seen_nodes:
+                                    seen_nodes.add(nid)
+                                    mem_results.append(r)
+                            if len(mem_results) >= 4:
+                                break
+                        if len(mem_results) >= 4:
+                            break
+
+                    mem_block = _format_memory_results(mem_results)
+                    mem_block = _truncate_text_to_tokens(mem_block, MEMORY_INJECT_MAX_TOKENS, enc)
+                    if mem_block:
+                        system_instructions = (
+                            system_instructions
+                            + "\n\nRelevant past context (from ChatGPT export memory; may be partial). "
+                            + "Only claim you found something if it appears below:\n"
+                            + mem_block
+                        )
+                except Exception as e:
+                    if debug:
+                        print(f"[debug] memory injection failed: {e}")
+
+                history = _ensure_budget_with_summary(
+                    conn,
+                    client,
+                    MODEL,
+                    agent_convo,
+                    system_instructions,
+                    REQUEST_BUDGET,
+                    enc,
+                    user_id,
                 )
+
+                # Ensure a single huge user paste doesn't blow the budget by itself.
+                # Leave headroom for system + tool reasoning.
+                max_user_tokens = max(256, REQUEST_BUDGET // 4)
+                text_for_model = _truncate_text_to_tokens(text, max_user_tokens, enc)
+
+                input_items = _build_context_token_aware(
+                    system_message=system_instructions,
+                    history_messages=history,
+                    new_user_text=text_for_model,
+                    budget_tokens=REQUEST_BUDGET,
+                    enc=enc,
+                )
+                if debug:
+                    print(f"[debug] approx request tokens: {_count_tokens(input_items, enc)}")
+
+                try:
+                    final_text, _ = run_with_tools(
+                        client=client,
+                        model=MODEL,
+                        tools_schema=tools_schema,
+                        input_items=input_items,
+                        conn=conn,
+                        user_id=user_id,
+                        debug=debug,
+                    )
+                except Exception as e:
+                    # If we still overflow the model's context window, retry with a smaller budget and no memory injection.
+                    if "context_length_exceeded" in str(e):
+                        if debug:
+                            print("[debug] context_length_exceeded: retrying with reduced budget")
+                        reduced_budget = max(4096, int(REQUEST_BUDGET * 0.6))
+                        input_items = _build_context_token_aware(
+                            system_message=(
+                                system_instructions
+                                + "\n\nNote: context was trimmed aggressively due to context window limits."
+                            ),
+                            history_messages=history[-10:],
+                            new_user_text=_truncate_text_to_tokens(text, max(256, reduced_budget // 4), enc),
+                            budget_tokens=reduced_budget,
+                            enc=enc,
+                        )
+                        final_text, _ = run_with_tools(
+                            client=client,
+                            model=MODEL,
+                            tools_schema=tools_schema,
+                            input_items=input_items,
+                            conn=conn,
+                            user_id=user_id,
+                            debug=debug,
+                        )
+                    else:
+                        raise
 
                 # Persist each sub-request as its own turn (keeps memory coherent)
                 add_message(conn, agent_convo, "user", f"{display_agent}: {text}")

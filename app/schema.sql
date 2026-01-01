@@ -108,3 +108,65 @@ CREATE TABLE IF NOT EXISTS experiments (
   artifact_path TEXT,
   created_at TEXT NOT NULL
 );
+-- =========================
+-- ChatGPT Export (Graph) Memory
+-- Lossless storage of ChatGPT conversations.json + indexes for retrieval
+-- =========================
+
+-- 1) Conversation metadata
+CREATE TABLE IF NOT EXISTS chatgpt_conversations (
+  id TEXT PRIMARY KEY,
+  title TEXT,
+  create_time INTEGER,
+  update_time INTEGER
+);
+
+-- 2) Conversation graph nodes
+CREATE TABLE IF NOT EXISTS chatgpt_nodes (
+  node_id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL,
+  parent_id TEXT,
+  role TEXT,                     -- 'user'/'assistant'/'system'/etc
+  text TEXT,                     -- joined parts
+  create_time INTEGER,
+  is_message INTEGER NOT NULL DEFAULT 1, -- 0 for structural/null nodes
+  main_child_id TEXT,            -- chosen for mainline traversal (computed in importer)
+  agent TEXT,                    -- 'life'/'ds'/'general' (optional)
+  FOREIGN KEY(conversation_id) REFERENCES chatgpt_conversations(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chatgpt_nodes_conv
+  ON chatgpt_nodes(conversation_id);
+
+CREATE INDEX IF NOT EXISTS idx_chatgpt_nodes_parent
+  ON chatgpt_nodes(parent_id);
+
+CREATE INDEX IF NOT EXISTS idx_chatgpt_nodes_agent
+  ON chatgpt_nodes(agent);
+
+-- 3) Full-text search over node text (fast candidate generation)
+-- Note: FTS5 is a separate virtual table; keep it simple.
+CREATE VIRTUAL TABLE IF NOT EXISTS chatgpt_nodes_fts
+USING fts5(
+  node_id,
+  conversation_id,
+  title,
+  agent,
+  text
+);
+
+-- 4) Embeddings for reranking (store as BLOB; cosine computed in Python)
+CREATE TABLE IF NOT EXISTS chatgpt_node_embeddings (
+  node_id TEXT PRIMARY KEY,
+  dim INTEGER NOT NULL,
+  vec BLOB NOT NULL,
+  FOREIGN KEY(node_id) REFERENCES chatgpt_nodes(node_id)
+);
+
+-- Optional: keep embeddings consistent with nodes
+CREATE TRIGGER IF NOT EXISTS trg_chatgpt_nodes_delete_embedding
+AFTER DELETE ON chatgpt_nodes
+BEGIN
+  DELETE FROM chatgpt_node_embeddings WHERE node_id = OLD.node_id;
+  DELETE FROM chatgpt_nodes_fts WHERE node_id = OLD.node_id;
+END;

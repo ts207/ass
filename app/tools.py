@@ -1,6 +1,10 @@
 import json, uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List
+import numpy as np
+from openai import OpenAI
+
+from app.config import EMBEDDING_MODEL
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -201,3 +205,91 @@ def ds_record_progress(conn, user_id: str, topic: str, score: float | None = Non
     )
     conn.commit()
     return {"id": pid, "topic": topic, "score": score_val, "notes": notes}
+
+from app.db import (
+    chatgpt_fts_candidates,
+    chatgpt_context_window,
+    chatgpt_get_conversation_title,
+    chatgpt_get_embeddings,
+)
+
+
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom == 0.0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+
+_openai_client: OpenAI | None = None
+
+
+def _get_openai_client() -> OpenAI:
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = OpenAI()
+    return _openai_client
+
+
+def _embed_query(text: str) -> np.ndarray:
+    client = _get_openai_client()
+    resp = client.embeddings.create(model=EMBEDDING_MODEL, input=[text])
+    vec = resp.data[0].embedding
+    return np.array(vec, dtype=np.float32)
+
+
+def memory_search_graph_tool(conn, query: str, agent: str, k: int = 5, candidate_limit: int = 100,
+                             context_up: int = 6, context_down: int = 4, use_embeddings: bool = True):
+    cands = chatgpt_fts_candidates(conn, query=query, agent=agent, limit=candidate_limit)
+
+    # Deduplicate by node_id while preserving order
+    seen = set()
+    ordered = []
+    for c in cands:
+        nid = c["node_id"]
+        if nid not in seen:
+            seen.add(nid)
+            ordered.append(c)
+
+    reranked = ordered
+    if use_embeddings and ordered:
+        emb_map = chatgpt_get_embeddings(conn, [c["node_id"] for c in ordered])
+        if emb_map:
+            try:
+                query_vec = _embed_query(query)
+                scored = []
+                no_embeds = []
+                for idx, c in enumerate(ordered):
+                    emb = emb_map.get(c["node_id"])
+                    if emb is None or emb.size == 0:
+                        no_embeds.append((idx, c))
+                        continue
+                    sim = _cosine_similarity(query_vec, emb)
+                    scored.append((sim, idx, c))
+
+                if scored:
+                    scored.sort(key=lambda x: x[0], reverse=True)
+                    reranked = [c for _, _, c in scored] + [c for _, c in no_embeds]
+            except Exception:
+                # Fall back to FTS order if embedding call fails
+                pass
+
+    results = []
+    for c in reranked[:k]:
+        nid = c["node_id"]
+        cid = c["conversation_id"]
+        title = chatgpt_get_conversation_title(conn, cid)
+        ctx = chatgpt_context_window(conn, nid, up=context_up, down=context_down)
+
+        context_text = "\n".join(
+            f'{m["role"]}: {m["text"]}' for m in ctx
+        )
+
+        results.append({
+            "node_id": nid,
+            "conversation_id": cid,
+            "title": title,
+            "context": context_text,
+        })
+
+    return {"results": results, "returned": len(results)}

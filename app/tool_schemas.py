@@ -1,5 +1,24 @@
 # app/tool_schemas.py
 
+memory_search_graph = {
+  "name": "memory_search_graph",
+  "description": "Search imported ChatGPT export memory (graph) and return faithful context windows.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {"type": "string"},
+      "agent": {"type": "string", "enum": ["life", "ds", "general"]},
+      "k": {"type": "integer", "default": 5, "minimum": 1, "maximum": 10},
+      "candidate_limit": {"type": "integer", "default": 100, "minimum": 10, "maximum": 500},
+      "context_up": {"type": "integer", "default": 6, "minimum": 0, "maximum": 30},
+      "context_down": {"type": "integer", "default": 4, "minimum": 0, "maximum": 30},
+      "use_embeddings": {"type": "boolean", "default": True}
+    },
+    "required": ["query", "agent"]
+  },
+  "type": "function",
+}
+
 LIFE_TOOLS = [
     {
         "type": "function",
@@ -30,6 +49,7 @@ LIFE_TOOLS = [
             "required": [],
         },
     },
+    memory_search_graph,
 ]
 
 DS_TOOLS = [
@@ -99,4 +119,22 @@ DS_TOOLS = [
             "required": ["topic"],
         },
     },
+    memory_search_graph,
 ]
+memory_search_graph = {
+    "name": "memory_search_graph",
+    "description": "Search imported ChatGPT export memory (graph) and return faithful context windows. Uses FTS candidates and optional embeddings rerank.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "agent": {"type": "string", "enum": ["life", "ds", "general"]},
+            "k": {"type": "integer", "default": 5, "minimum": 1, "maximum": 10},
+            "candidate_limit": {"type": "integer", "default": 100, "minimum": 10, "maximum": 500},
+            "context_up": {"type": "integer", "default": 6, "minimum": 0, "maximum": 30},
+            "context_down": {"type": "integer", "default": 4, "minimum": 0, "maximum": 30},
+            "use_embeddings": {"type": "boolean", "default": True},
+        },
+        "required": ["query", "agent"],
+    },
+}

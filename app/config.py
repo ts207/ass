@@ -5,8 +5,15 @@ DATA_DIR.mkdir(exist_ok=True)
 
 DB_PATH = DATA_DIR / "assistant.sqlite3"
 
-MODEL = "gpt-5"  # change to your preferred model
+MODEL = "gpt-5.2"  # change to your preferred model
+EMBEDDING_MODEL = "text-embedding-3-small"  # default for ChatGPT export memory
 SYSTEM_INSTRUCTIONS = "You are a helpful assistant."
 
+# Context budgeting (token-aware trimming/summarization).
+# Set this to your model's actual context length if different.
+MODEL_CONTEXT_TOKENS = 32_768
+REQUEST_BUDGET_FRACTION = 0.7
+MEMORY_INJECT_MAX_TOKENS = 1_200
+
 # simple MVP limit: last K messages (not tokens)
-MAX_HISTORY_MESSAGES = 24
+MAX_HISTORY_MESSAGES = 40
