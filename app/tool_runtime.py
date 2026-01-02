@@ -96,9 +96,9 @@ def call_tool(name: str, args: Dict[str, Any], *, conn, user_id: str) -> str:
                 query=args["query"],
                 agent=args["agent"],
                 k=int(args.get("k", 5)),
-                candidate_limit=int(args.get("candidate_limit", 100)),
+                candidate_limit=int(args.get("candidate_limit", 250)),
                 context_up=int(args.get("context_up", 6)),
-                context_down=int(args.get("context_down", 4)),
+                context_down=int(args.get("context_down", 2)),
                 use_embeddings=use_embeddings_flag,
             )
             return json.dumps(out, ensure_ascii=False)

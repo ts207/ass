@@ -37,6 +37,8 @@ ds: quiz me on train/test split
 code: help debug this traceback
 ```
 
+Streamlit shows a collapsible “Memory used” panel (sidebar) for the last turn.
+
 ## ChatGPT Export Memory (Graph + Hybrid Search)
 
 This imports `conversations.json` or `chat.html` as a **lossless conversation graph**, builds an SQLite **FTS5** index, and optionally reranks FTS results using OpenAI **embeddings**.
@@ -61,6 +63,12 @@ Self-check:
 
 ```bash
 python scripts/selfcheck_memory.py --auto-agent --query python --search-agent ds
+```
+
+Eval harness (iterate on retrieval quality):
+
+```bash
+python scripts/eval_memory.py --queries queries.txt --debug
 ```
 
 ## Profile Memory (Stable Facts)

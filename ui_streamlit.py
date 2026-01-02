@@ -117,6 +117,35 @@ _STOPWORDS = {
     "it", "this", "that", "these", "those", "my", "your", "our", "their", "me", "him", "her", "them", "as",
 }
 
+_MEMORY_TRIGGERS = (
+    "last time",
+    "previous",
+    "previously",
+    "earlier",
+    "before",
+    "remember",
+    "what did i",
+    "what did we",
+    "as we discussed",
+    "as i said",
+    "you said",
+    "continue",
+    "pick up",
+    "where was i",
+    "my plan",
+    "my schedule",
+    "my progress",
+    "my goals",
+    "my preferences",
+)
+
+
+def _should_retrieve_memory(text: str) -> bool:
+    t = (text or "").lower().strip()
+    if not t:
+        return False
+    return any(k in t for k in _MEMORY_TRIGGERS)
+
 
 def _query_variants(text: str) -> list[str]:
     raw = (text or "").strip()
@@ -206,6 +235,22 @@ with st.sidebar:
         st.rerun()
 
     st.caption(f"Conversation: {st.session_state.convo_id}")
+    with st.expander("Memory used", expanded=False):
+        dbg = st.session_state.get("last_memory_debug")
+        if not dbg:
+            st.caption("No memory retrieval on the last turn.")
+        else:
+            q = dbg.get("query", {})
+            st.write(f"Query: `{q.get('raw')}`")
+            if q.get("cleaned"):
+                st.write(f"Cleaned: `{q.get('cleaned')}`")
+            if q.get("keywords"):
+                st.write(f"Keywords: `{', '.join(q.get('keywords'))}`")
+            for r in (dbg.get("top_results") or [])[:3]:
+                st.write(f"- `{r.get('node_id')}` — {r.get('title') or '(untitled)'}")
+                ctx = (r.get("context") or "").strip()
+                if ctx:
+                    st.caption(ctx[:300] + ("…" if len(ctx) > 300 else ""))
 
 # --- load and display history ---
 history = get_recent_messages(conn, st.session_state.convo_id, MAX_HISTORY_MESSAGES)
@@ -242,6 +287,9 @@ if prompt:
             f"You are the Life Manager. User timezone: {tz}. "
             "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
             "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
+            "\n\nMemory policy: If the user references past context or asks for personalization/continuation, call memory_search_graph before answering. "
+            "Use k=5 candidate_limit=250 context_up=4 context_down=2. "
+            "Life query format: <goal/symptom> <routine> <constraint> <timeframe>."
         )
     elif agent == "health":
         system_instructions = (
@@ -249,17 +297,26 @@ if prompt:
             "You are not a doctor; give general, evidence-based guidance and encourage professional help for urgent symptoms. "
             "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
             "If the user explicitly asks to save/update stable facts (timezone, conditions, meds, preferences, goals), call set_profile."
+            "\n\nMemory policy: If the user references past symptoms, treatments, labs, routines, or asks to continue a plan, call memory_search_graph before answering. "
+            "Use k=5 candidate_limit=250 context_up=4 context_down=2. "
+            "Health query format: <symptom/goal> <med/supplement/routine> <constraint> <timeframe>."
         )
     elif agent == "code":
         system_instructions = (
             "You are the Coding assistant. Help with debugging, architecture, and implementation details. "
             "When useful, log progress with code_record_progress and review history with code_list_progress. "
             "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
+            "\n\nMemory policy: If the user references prior debugging, ongoing work, or asks to continue, call memory_search_graph before answering. "
+            "Use k=5 candidate_limit=250 context_up=6 context_down=2. "
+            "Code query format: <language/tool> <error/problem> <file/module> <goal>."
         )
     else:
         system_instructions = (
             "You are the Applied Data Science Tutor and assistant. Focus on lab-based learning. "
             "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
+            "\n\nMemory policy: If the user references past work, progress, or asks to continue, call memory_search_graph before answering. "
+            "Use k=5 candidate_limit=250 context_up=6 context_down=2. "
+            "DS query format: <topic> <error/problem> <library/tool> <outcome/goal>."
         )
 
     if profile:
@@ -277,31 +334,33 @@ if prompt:
         from app.tools import memory_search_graph_tool
 
         mem_results = []
-        seen_nodes = set()
-        variants = _query_variants(prompt)
-        agent_tags = [agent] if agent in ("life", "health", "ds", "code") else ["general"]
-
-        for agent_tag in agent_tags:
-            for q in variants[:2]:
-                mem = memory_search_graph_tool(
-                    conn,
-                    query=q,
-                    agent=agent_tag,
-                    k=MEMORY_INJECT_K,
-                    candidate_limit=MEMORY_INJECT_CANDIDATE_LIMIT,
-                    context_up=6,
-                    context_down=4,
-                    use_embeddings=True,
-                )
-                for r in mem.get("results", []) or []:
-                    nid = r.get("node_id")
-                    if nid and nid not in seen_nodes:
-                        seen_nodes.add(nid)
-                        mem_results.append(r)
-                if len(mem_results) >= MEMORY_INJECT_K:
-                    break
-            if len(mem_results) >= MEMORY_INJECT_K:
-                break
+        st.session_state["last_memory_debug"] = None
+        if _should_retrieve_memory(prompt):
+            ctx_defaults = {
+                "life": (4, 2),
+                "health": (4, 2),
+                "ds": (6, 2),
+                "code": (6, 2),
+                "general": (6, 2),
+            }
+            up, down = ctx_defaults.get(agent, (6, 2))
+            mem = memory_search_graph_tool(
+                conn,
+                query=prompt,
+                agent=agent,
+                k=MEMORY_INJECT_K,
+                candidate_limit=MEMORY_INJECT_CANDIDATE_LIMIT,
+                context_up=up,
+                context_down=down,
+                use_embeddings=True,
+                debug=True,
+            )
+            mem_results = mem.get("results", []) or []
+            dbg = mem.get("debug") or {}
+            st.session_state["last_memory_debug"] = {
+                "query": dbg.get("query") or {"raw": prompt},
+                "top_results": mem_results[:3],
+            }
 
         mem_block = _format_memory_results(mem_results)
         mem_block = _truncate_text_to_tokens(mem_block, MEMORY_INJECT_MAX_TOKENS)

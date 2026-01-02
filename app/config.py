@@ -16,7 +16,7 @@ REQUEST_BUDGET_FRACTION = 0.7
 
 # Auto-injected long-term memory (from imported ChatGPT export)
 MEMORY_INJECT_K = 6
-MEMORY_INJECT_CANDIDATE_LIMIT = 500
+MEMORY_INJECT_CANDIDATE_LIMIT = 250
 MEMORY_INJECT_MAX_TOKENS = 3_000
 
 # Auto-injected stable profile memory (user-controlled)

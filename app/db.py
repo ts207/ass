@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import re
 
-def _fts_query(user_query: str) -> str:
+def _fts_query(user_query: str, *, mode: str = "auto") -> str:
     """
     Make a safer FTS5 MATCH query from free text.
     - splits into tokens
@@ -22,24 +22,43 @@ def _fts_query(user_query: str) -> str:
         if re.search(r'[^A-Za-z0-9_]', t) or re.search(r'["\*\:\-\(\)\[\]\{\}\^~]', t):
             t = '"' + t.replace('"', '""') + '"'
         out.append(t)
-    joiner = " OR " if len(out) > 6 else " AND "
+    if mode == "or":
+        joiner = " OR "
+    elif mode == "and":
+        joiner = " AND "
+    else:
+        joiner = " OR " if len(out) > 6 else " AND "
     return joiner.join(out)
 
-def chatgpt_fts_candidates(conn, query: str, agent: str, limit: int = 100) -> List[Dict[str, Any]]:
-    q = _fts_query(query)
+def chatgpt_fts_candidates(conn, query: str, agent: str, limit: int = 100, *, mode: str = "auto") -> List[Dict[str, Any]]:
+    """
+    Return candidate nodes from FTS5 ordered by bm25 rank (best first).
+    Includes extra fields used for hybrid scoring.
+    """
+    q = _fts_query(query, mode=mode)
     if not q or limit <= 0:
         return []
+
+    # Oversample to allow dedupe and secondary filtering without starving results.
     raw_limit = min(max(limit * 5, limit), 5000)
     rows = conn.execute(
         """
-        SELECT node_id, conversation_id
+        SELECT
+          chatgpt_nodes_fts.node_id,
+          chatgpt_nodes_fts.conversation_id,
+          chatgpt_nodes_fts.title,
+          bm25(chatgpt_nodes_fts) AS bm25_rank,
+          chatgpt_nodes.create_time
         FROM chatgpt_nodes_fts
+        JOIN chatgpt_nodes ON chatgpt_nodes.node_id = chatgpt_nodes_fts.node_id
         WHERE chatgpt_nodes_fts MATCH ?
-          AND (? = 'general' OR agent = ? OR agent = 'general')
+          AND (? = 'general' OR chatgpt_nodes_fts.agent = ? OR chatgpt_nodes_fts.agent = 'general')
+        ORDER BY bm25(chatgpt_nodes_fts) ASC
         LIMIT ?
         """,
         (q, agent, agent, raw_limit),
     ).fetchall()
+
     out: List[Dict[str, Any]] = []
     seen: set[str] = set()
     for r in rows:
@@ -47,7 +66,15 @@ def chatgpt_fts_candidates(conn, query: str, agent: str, limit: int = 100) -> Li
         if node_id in seen:
             continue
         seen.add(node_id)
-        out.append({"node_id": node_id, "conversation_id": r[1]})
+        out.append(
+            {
+                "node_id": node_id,
+                "conversation_id": r[1],
+                "title": r[2] or "",
+                "bm25": float(r[3]) if r[3] is not None else 0.0,
+                "create_time": int(r[4] or 0),
+            }
+        )
         if len(out) >= limit:
             break
     return out
