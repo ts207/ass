@@ -169,7 +169,7 @@ Edit `app/config.py`:
 
 ## ChatGPT Export Memory
 
-This imports your ChatGPT `conversations.json` as a graph, builds FTS candidates, and optionally reranks with embeddings. The `memory_search_graph` tool is available to both `life` and `ds` agents.
+This imports your ChatGPT export as a graph, builds FTS candidates, and optionally reranks with embeddings. The `memory_search_graph` tool is available to both `life` and `ds` agents. Imports support **conversations.json** or **chat.html** (HTML export with `jsonData`).
 
 ### Steps
 
@@ -177,11 +177,11 @@ This imports your ChatGPT `conversations.json` as a graph, builds FTS candidates
 # Apply schema (safe IF NOT EXISTS, run once)
 sqlite3 data/assistant.sqlite3 < app/schema.sql
 
-# Import ChatGPT export (place conversations.json in repo root)
-python scripts/import_chatgpt_export.py --export conversations.json --auto-agent
+# Import ChatGPT export (place conversations.json or chat.html in repo root)
+python scripts/import_chatgpt_export.py --export chat.html --auto-agent
 
-# Backfill embeddings (optional rerank; uses float32 blobs)
-python scripts/backfill_embeddings.py --model text-embedding-3-small --batch 128
+# Backfill embeddings (optional rerank; uses float32 blobs). --limit 0 = all
+python scripts/backfill_embeddings.py --model text-embedding-3-small --batch 128 --limit 0
 
 # Verify embeddings count
 sqlite3 data/assistant.sqlite3 "select count(*) from chatgpt_node_embeddings;"
