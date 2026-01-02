@@ -9,19 +9,29 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
 import numpy as np
+from dotenv import load_dotenv
 from openai import OpenAI
-import tiktoken
 
 DEFAULT_DB = Path(__file__).resolve().parents[1] / "data" / "assistant.sqlite3"
 DEFAULT_MODEL = "text-embedding-3-small"
-MAX_TOKENS_PER_REQUEST = 8000
-MAX_TOKENS_PER_TEXT = 8000
-ENCODING = tiktoken.get_encoding("cl100k_base")
+MAX_TOKENS_PER_REQUEST = 7800
+MAX_TOKENS_PER_TEXT = 7800
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+load_dotenv(REPO_ROOT / ".env")
+
+from app.token_utils import try_get_encoding, token_len, truncate_to_tokens  # noqa: E402
+
+ENCODING = try_get_encoding()
 
 
 def ensure_tables(conn: sqlite3.Connection) -> None:
@@ -68,16 +78,11 @@ def embed_batch(client: OpenAI, texts: List[str], model: str, retries: int = 5, 
     return []
 
 def _token_len(text: str) -> int:
-    return len(ENCODING.encode(text))
+    return token_len(text, ENCODING)
 
 
 def _truncate_to_tokens(text: str, max_tokens: int) -> str:
-    if max_tokens <= 0:
-        return ""
-    toks = ENCODING.encode(text)
-    if len(toks) <= max_tokens:
-        return text
-    return ENCODING.decode(toks[:max_tokens]) + "\n\n[truncated]"
+    return truncate_to_tokens(text, max_tokens, ENCODING)
 
 
 def main():
@@ -89,10 +94,10 @@ def main():
     ap.add_argument("--sleep", type=float, default=0.2, help="Seconds to pause between batches")
     args = ap.parse_args()
 
-    conn = sqlite3.connect(args.db)
+    conn = sqlite3.connect(str(args.db))
     try:
         ensure_tables(conn)
-        limit = None if args.limit is None or args.limit <= 0 else args.limit
+        limit = None if args.limit <= 0 else args.limit
         pending = fetch_pending(conn, limit)
         total = len(pending)
         if total == 0:

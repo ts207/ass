@@ -1,22 +1,49 @@
 # app/tool_schemas.py
 
 memory_search_graph = {
-  "name": "memory_search_graph",
-  "description": "Search imported ChatGPT export memory (graph) and return faithful context windows.",
-  "parameters": {
-    "type": "object",
-    "properties": {
-      "query": {"type": "string"},
-      "agent": {"type": "string", "enum": ["life", "ds", "general"]},
-      "k": {"type": "integer", "default": 5, "minimum": 1, "maximum": 10},
-      "candidate_limit": {"type": "integer", "default": 100, "minimum": 10, "maximum": 500},
-      "context_up": {"type": "integer", "default": 6, "minimum": 0, "maximum": 30},
-      "context_down": {"type": "integer", "default": 4, "minimum": 0, "maximum": 30},
-      "use_embeddings": {"type": "boolean", "default": True}
+    "type": "function",
+    "name": "memory_search_graph",
+    "description": "Search imported ChatGPT export memory (graph) and return faithful context windows. Uses FTS candidates and optional embeddings rerank.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "agent": {"type": "string", "enum": ["life", "ds", "general"]},
+            "k": {"type": "integer", "default": 5, "minimum": 1, "maximum": 10},
+            "candidate_limit": {"type": "integer", "default": 100, "minimum": 10, "maximum": 500},
+            "context_up": {"type": "integer", "default": 6, "minimum": 0, "maximum": 30},
+            "context_down": {"type": "integer", "default": 4, "minimum": 0, "maximum": 30},
+            "use_embeddings": {"type": "boolean", "default": True},
+        },
+        "required": ["query", "agent"],
     },
-    "required": ["query", "agent"]
-  },
-  "type": "function",
+}
+
+set_profile = {
+    "type": "function",
+    "name": "set_profile",
+    "description": "Save/update stable user profile facts/preferences/goals locally so they can be injected every turn.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "profile": {
+                "type": "object",
+                "description": "Profile fields to merge (e.g. {\"timezone\":\"Asia/Ulaanbaatar\",\"preferences\":{...}}).",
+                "additionalProperties": True,
+            },
+            "replace": {
+                "type": "boolean",
+                "default": False,
+                "description": "If true, replace the entire stored profile instead of merging.",
+            },
+            "remove_keys": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional top-level keys to remove from the stored profile.",
+            },
+        },
+        "required": ["profile"],
+    },
 }
 
 LIFE_TOOLS = [
@@ -50,6 +77,7 @@ LIFE_TOOLS = [
         },
     },
     memory_search_graph,
+    set_profile,
 ]
 
 DS_TOOLS = [
@@ -120,21 +148,5 @@ DS_TOOLS = [
         },
     },
     memory_search_graph,
+    set_profile,
 ]
-memory_search_graph = {
-    "name": "memory_search_graph",
-    "description": "Search imported ChatGPT export memory (graph) and return faithful context windows. Uses FTS candidates and optional embeddings rerank.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string"},
-            "agent": {"type": "string", "enum": ["life", "ds", "general"]},
-            "k": {"type": "integer", "default": 5, "minimum": 1, "maximum": 10},
-            "candidate_limit": {"type": "integer", "default": 100, "minimum": 10, "maximum": 500},
-            "context_up": {"type": "integer", "default": 6, "minimum": 0, "maximum": 30},
-            "context_down": {"type": "integer", "default": 4, "minimum": 0, "maximum": 30},
-            "use_embeddings": {"type": "boolean", "default": True},
-        },
-        "required": ["query", "agent"],
-    },
-}

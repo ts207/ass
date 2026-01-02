@@ -1,10 +1,10 @@
 import argparse
+import json
 import threading
 from datetime import datetime, timezone
 from openai import OpenAI
 from pathlib import Path
 from dotenv import load_dotenv
-import tiktoken
 import re
 load_dotenv()
 
@@ -15,6 +15,9 @@ from .config import (
     MODEL_CONTEXT_TOKENS,
     REQUEST_BUDGET_FRACTION,
     MEMORY_INJECT_MAX_TOKENS,
+    MEMORY_INJECT_K,
+    MEMORY_INJECT_CANDIDATE_LIMIT,
+    PROFILE_INJECT_MAX_TOKENS,
 )
 from .db import (
     connect,
@@ -27,9 +30,11 @@ from .db import (
     get_agent_conversation_id,
     set_agent_conversation_id,
     run_migrations,
+    get_user_profile,
 )
 from .tool_loop import run_with_tools
 from .tool_schemas import LIFE_TOOLS, DS_TOOLS
+from .token_utils import try_get_encoding, count_message_tokens, token_len, truncate_to_tokens
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
@@ -65,11 +70,11 @@ def _msg(role: str, text: str):
 
 
 def _get_encoding():
-    return tiktoken.get_encoding("cl100k_base")
+    return try_get_encoding()
 
 
 def _count_tokens(messages, enc) -> int:
-    return sum(len(enc.encode(m["role"])) + len(enc.encode(m["content"])) for m in messages)
+    return count_message_tokens(messages, enc)
 
 
 def _fetch_all_messages(conn, convo_id: str):
@@ -113,7 +118,7 @@ def _ensure_budget_with_summary(conn, client, model, convo_id: str, system_messa
         chunk_tokens = 0
         target = max(512, budget_tokens // 5)
         for m in messages:
-            t = len(enc.encode(m["role"])) + len(enc.encode(m["content"]))
+            t = token_len(m["role"], enc) + token_len(m["content"], enc)
             chunk.append(m)
             chunk_tokens += t
             if chunk_tokens >= target:
@@ -133,12 +138,12 @@ def _ensure_budget_with_summary(conn, client, model, convo_id: str, system_messa
 def _build_context_token_aware(system_message: str, history_messages, new_user_text: str, budget_tokens: int, enc):
     base = [{"role": "system", "content": system_message}]
     acc_tokens = _count_tokens(base, enc)
-    user_tokens = len(enc.encode("user")) + len(enc.encode(new_user_text))
+    user_tokens = token_len("user", enc) + token_len(new_user_text, enc)
     acc_tokens += user_tokens
 
     selected = []
     for m in reversed(history_messages):
-        t = len(enc.encode(m["role"])) + len(enc.encode(m["content"]))
+        t = token_len(m["role"], enc) + token_len(m["content"], enc)
         if acc_tokens + t > budget_tokens:
             break
         selected.append({"role": m["role"], "content": m["content"]})
@@ -148,12 +153,7 @@ def _build_context_token_aware(system_message: str, history_messages, new_user_t
 
 
 def _truncate_text_to_tokens(text: str, max_tokens: int, enc) -> str:
-    if max_tokens <= 0:
-        return ""
-    toks = enc.encode(text)
-    if len(toks) <= max_tokens:
-        return text
-    return enc.decode(toks[:max_tokens]) + "\n\n[truncated]"
+    return truncate_to_tokens(text, max_tokens, enc)
 
 
 def _format_memory_results(results: list[dict], *, max_chars: int = 6000) -> str:
@@ -185,9 +185,13 @@ def _query_variants(text: str, enc) -> list[str]:
     variants: list[str] = [raw]
 
     # Shortened variant (first ~80 tokens) to avoid over-specificity.
-    toks = enc.encode(raw)
-    if len(toks) > 80:
-        variants.append(enc.decode(toks[:80]))
+    if enc is not None:
+        toks = enc.encode(raw)
+        if len(toks) > 80:
+            variants.append(enc.decode(toks[:80]))
+    else:
+        if len(raw) > 400:
+            variants.append(raw[:400])
 
     # Keyword variant for better FTS recall.
     words = re.findall(r"[A-Za-z0-9_']{3,}", raw.lower())
@@ -352,13 +356,33 @@ def main():
                     set_agent_conversation_id(conn, user_id, agent, agent_convo)
 
                 tools_schema = LIFE_TOOLS if agent == "life" else DS_TOOLS
+                profile = get_user_profile(conn, user_id)
+                tz = ""
+                if isinstance(profile.get("timezone"), str):
+                    tz = profile["timezone"].strip()
+                elif isinstance(profile.get("tz"), str):
+                    tz = profile["tz"].strip()
+                if not tz:
+                    tz = "Asia/Ulaanbaatar"
                 system_instructions = (
-                    "You are the Life Manager. User timezone: Asia/Ulaanbaatar. "
-                    "If you schedule reminders, always output due_at as ISO 8601 with timezone offset."
+                    f"You are the Life Manager. User timezone: {tz}. "
+                    "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
+                    "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
                     if agent == "life"
                     else
-                    "You are a Data Science Course Assistant. You can design short courses, serve lessons, grade submissions, and adapt the plan based on progress."
+                    "You are a Data Science Course Assistant. You can design short courses, serve lessons, grade submissions, and adapt the plan based on progress. "
+                    "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
                 )
+
+                if profile:
+                    profile_blob = json.dumps(profile, ensure_ascii=False, indent=2)
+                    profile_blob = _truncate_text_to_tokens(profile_blob, PROFILE_INJECT_MAX_TOKENS, enc)
+                    if profile_blob:
+                        system_instructions = (
+                            system_instructions
+                            + "\n\nUser profile (stable facts, user-provided). Use as ground truth; do not invent missing fields:\n"
+                            + profile_blob
+                        )
 
                 # Auto-retrieve from imported ChatGPT export memory and inject as system context.
                 # This makes memory available even when the model doesn't decide to call the tool.
@@ -368,7 +392,7 @@ def main():
                     mem_results: list[dict] = []
                     seen_nodes: set[str] = set()
                     variants = _query_variants(text, enc)
-                    agent_tags = [agent, "general"] if agent in ("life", "ds") else ["general"]
+                    agent_tags = [agent] if agent in ("life", "ds") else ["general"]
 
                     # Keep this bounded; don't spam the API.
                     for agent_tag in agent_tags:
@@ -377,8 +401,8 @@ def main():
                                 conn,
                                 query=q,
                                 agent=agent_tag,
-                                k=4,
-                                candidate_limit=200,
+                                k=MEMORY_INJECT_K,
+                                candidate_limit=MEMORY_INJECT_CANDIDATE_LIMIT,
                                 context_up=6,
                                 context_down=4,
                                 use_embeddings=True,
@@ -388,9 +412,9 @@ def main():
                                 if nid and nid not in seen_nodes:
                                     seen_nodes.add(nid)
                                     mem_results.append(r)
-                            if len(mem_results) >= 4:
+                            if len(mem_results) >= MEMORY_INJECT_K:
                                 break
-                        if len(mem_results) >= 4:
+                        if len(mem_results) >= MEMORY_INJECT_K:
                             break
 
                     mem_block = _format_memory_results(mem_results)

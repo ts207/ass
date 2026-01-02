@@ -1,6 +1,6 @@
 import streamlit as st
 from openai import OpenAI
-import tiktoken
+import json
 from pathlib import Path
 import re
 
@@ -11,29 +11,33 @@ from app.config import (
     MODEL_CONTEXT_TOKENS,
     REQUEST_BUDGET_FRACTION,
     MEMORY_INJECT_MAX_TOKENS,
+    MEMORY_INJECT_K,
+    MEMORY_INJECT_CANDIDATE_LIMIT,
+    PROFILE_INJECT_MAX_TOKENS,
 )
-from app.db import connect, init_db, get_recent_messages, add_message, create_conversation
+from app.db import connect, init_db, run_migrations, get_recent_messages, add_message, create_conversation, get_user_profile
 from app.tool_loop import run_with_tools
 from app.tool_schemas import LIFE_TOOLS, DS_TOOLS
+from app.token_utils import try_get_encoding, count_message_tokens, token_len, truncate_to_tokens
 
 SCHEMA_PATH = Path("app/schema.sql")
-ENCODING = tiktoken.get_encoding("cl100k_base")
+ENCODING = try_get_encoding()
 REQUEST_BUDGET = int(MODEL_CONTEXT_TOKENS * REQUEST_BUDGET_FRACTION)
 
 
 def _count_tokens(messages):
-    return sum(len(ENCODING.encode(m["role"])) + len(ENCODING.encode(m["content"])) for m in messages)
+    return count_message_tokens(messages, ENCODING)
 
 
 def _build_context_token_aware(system_message: str, history_messages, new_user_text: str, budget_tokens: int):
     base = [{"role": "system", "content": system_message}]
     acc_tokens = _count_tokens(base)
-    user_tokens = len(ENCODING.encode("user")) + len(ENCODING.encode(new_user_text))
+    user_tokens = token_len("user", ENCODING) + token_len(new_user_text, ENCODING)
     acc_tokens += user_tokens
 
     selected = []
     for m in reversed(history_messages):
-        t = len(ENCODING.encode(m["role"])) + len(ENCODING.encode(m["content"]))
+        t = token_len(m["role"], ENCODING) + token_len(m["content"], ENCODING)
         if acc_tokens + t > budget_tokens:
             break
         selected.append({"role": m["role"], "content": m["content"]})
@@ -43,12 +47,7 @@ def _build_context_token_aware(system_message: str, history_messages, new_user_t
 
 
 def _truncate_text_to_tokens(text: str, max_tokens: int) -> str:
-    if max_tokens <= 0:
-        return ""
-    toks = ENCODING.encode(text)
-    if len(toks) <= max_tokens:
-        return text
-    return ENCODING.decode(toks[:max_tokens]) + "\n\n[truncated]"
+    return truncate_to_tokens(text, max_tokens, ENCODING)
 
 
 def _format_memory_results(results, *, max_chars: int = 6000) -> str:
@@ -115,9 +114,13 @@ def _query_variants(text: str) -> list[str]:
         return []
     variants = [raw]
 
-    toks = ENCODING.encode(raw)
-    if len(toks) > 80:
-        variants.append(ENCODING.decode(toks[:80]))
+    if ENCODING is not None:
+        toks = ENCODING.encode(raw)
+        if len(toks) > 80:
+            variants.append(ENCODING.decode(toks[:80]))
+    else:
+        if len(raw) > 400:
+            variants.append(raw[:400])
 
     words = re.findall(r"[A-Za-z0-9_']{3,}", raw.lower())
     seen = set()
@@ -153,6 +156,7 @@ def get_client():
 def get_conn():
     conn = connect(DB_PATH)
     init_db(conn, SCHEMA_PATH.read_text(encoding="utf-8"))
+    run_migrations(conn)
     return conn
 
 client = get_client()
@@ -191,13 +195,33 @@ if prompt:
     agent = st.session_state.agent
     tools_schema = LIFE_TOOLS if agent == "life" else DS_TOOLS
 
+    profile = get_user_profile(conn, user_id)
+    tz = ""
+    if isinstance(profile.get("timezone"), str):
+        tz = profile["timezone"].strip()
+    elif isinstance(profile.get("tz"), str):
+        tz = profile["tz"].strip()
+    if not tz:
+        tz = "Asia/Ulaanbaatar"
     system_instructions = (
-        "You are the Life Manager. User timezone: Asia/Ulaanbaatar. "
-        "If you schedule reminders, always output due_at as ISO 8601 with timezone offset."
+        f"You are the Life Manager. User timezone: {tz}. "
+        "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
+        "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
         if agent == "life"
         else
-        "You are the Applied Data Science Tutor and assistant. Focus on data data analysis lab-based learning."
+        "You are the Applied Data Science Tutor and assistant. Focus on data data analysis lab-based learning. "
+        "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
     )
+
+    if profile:
+        profile_blob = json.dumps(profile, ensure_ascii=False, indent=2)
+        profile_blob = _truncate_text_to_tokens(profile_blob, PROFILE_INJECT_MAX_TOKENS)
+        if profile_blob:
+            system_instructions = (
+                system_instructions
+                + "\n\nUser profile (stable facts, user-provided). Use as ground truth; do not invent missing fields:\n"
+                + profile_blob
+            )
 
     # Auto-retrieve from imported ChatGPT export memory and inject as system context.
     try:
@@ -206,7 +230,7 @@ if prompt:
         mem_results = []
         seen_nodes = set()
         variants = _query_variants(prompt)
-        agent_tags = [agent, "general"] if agent in ("life", "ds") else ["general"]
+        agent_tags = [agent] if agent in ("life", "ds") else ["general"]
 
         for agent_tag in agent_tags:
             for q in variants[:2]:
@@ -214,8 +238,8 @@ if prompt:
                     conn,
                     query=q,
                     agent=agent_tag,
-                    k=4,
-                    candidate_limit=200,
+                    k=MEMORY_INJECT_K,
+                    candidate_limit=MEMORY_INJECT_CANDIDATE_LIMIT,
                     context_up=6,
                     context_down=4,
                     use_embeddings=True,
@@ -225,9 +249,9 @@ if prompt:
                     if nid and nid not in seen_nodes:
                         seen_nodes.add(nid)
                         mem_results.append(r)
-                if len(mem_results) >= 4:
+                if len(mem_results) >= MEMORY_INJECT_K:
                     break
-            if len(mem_results) >= 4:
+            if len(mem_results) >= MEMORY_INJECT_K:
                 break
 
         mem_block = _format_memory_results(mem_results)

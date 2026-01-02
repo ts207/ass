@@ -85,6 +85,23 @@ def call_tool(name: str, args: Dict[str, Any], *, conn, user_id: str) -> str:
             )
             return json.dumps(out, ensure_ascii=False)
 
+        if name == "set_profile":
+            profile = args.get("profile")
+            if profile is None and isinstance(args.get("updates"), dict):
+                profile = args.get("updates")
+            replace_flag = bool(args.get("replace", False))
+            remove_keys = args.get("remove_keys")
+            if remove_keys is not None and not isinstance(remove_keys, list):
+                remove_keys = None
+            out = t.set_profile_tool(
+                conn,
+                user_id=user_id,
+                profile=profile or {},
+                replace=replace_flag,
+                remove_keys=remove_keys,
+            )
+            return json.dumps(out, ensure_ascii=False)
+
         raise ToolError(f"Unknown tool: {name}")
 
     except Exception as e:

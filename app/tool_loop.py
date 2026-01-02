@@ -67,6 +67,7 @@ def run_with_tools(
             tools=tools_schema,
             input=follow_up_input,
             previous_response_id=previous_response_id,
+            truncation="auto",
         )
         output_items = [_item_to_dict(x) for x in (response.output or [])]
 

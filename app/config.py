@@ -11,9 +11,16 @@ SYSTEM_INSTRUCTIONS = "You are a helpful assistant."
 
 # Context budgeting (token-aware trimming/summarization).
 # Set this to your model's actual context length if different.
-MODEL_CONTEXT_TOKENS = 32_768
+MODEL_CONTEXT_TOKENS = 8_192
 REQUEST_BUDGET_FRACTION = 0.7
-MEMORY_INJECT_MAX_TOKENS = 1_200
+
+# Auto-injected long-term memory (from imported ChatGPT export)
+MEMORY_INJECT_K = 6
+MEMORY_INJECT_CANDIDATE_LIMIT = 500
+MEMORY_INJECT_MAX_TOKENS = 3_000
+
+# Auto-injected stable profile memory (user-controlled)
+PROFILE_INJECT_MAX_TOKENS = 600
 
 # simple MVP limit: last K messages (not tokens)
 MAX_HISTORY_MESSAGES = 40

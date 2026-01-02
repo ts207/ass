@@ -1,5 +1,6 @@
 import sqlite3
 import uuid
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,7 +22,8 @@ def _fts_query(user_query: str) -> str:
         if re.search(r'[^A-Za-z0-9_]', t) or re.search(r'["\*\:\-\(\)\[\]\{\}\^~]', t):
             t = '"' + t.replace('"', '""') + '"'
         out.append(t)
-    return " AND ".join(out)
+    joiner = " OR " if len(out) > 6 else " AND "
+    return joiner.join(out)
 
 def chatgpt_fts_candidates(conn, query: str, agent: str, limit: int = 100) -> List[Dict[str, Any]]:
     q = _fts_query(query)
@@ -32,7 +34,7 @@ def chatgpt_fts_candidates(conn, query: str, agent: str, limit: int = 100) -> Li
         SELECT node_id, conversation_id
         FROM chatgpt_nodes_fts
         WHERE chatgpt_nodes_fts MATCH ?
-          AND (agent = ? OR ? = 'general')
+          AND (? = 'general' OR agent = ? OR agent = 'general')
         LIMIT ?
         """,
         (q, agent, agent, limit),
@@ -355,3 +357,34 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         pass
 
     conn.commit()
+
+
+def get_user_profile(conn: sqlite3.Connection, user_id: str) -> Dict[str, Any]:
+    row = conn.execute(
+        "SELECT profile_json FROM user_profiles WHERE user_id=?",
+        (user_id,),
+    ).fetchone()
+    if not row:
+        return {}
+    raw = row["profile_json"] if hasattr(row, "keys") else row[0]
+    try:
+        return json.loads(raw) if raw else {}
+    except Exception:
+        return {}
+
+
+def upsert_user_profile(conn: sqlite3.Connection, user_id: str, profile: Dict[str, Any]) -> Dict[str, Any]:
+    now = _now_iso()
+    payload = json.dumps(profile or {}, ensure_ascii=False)
+    conn.execute(
+        """
+        INSERT INTO user_profiles (user_id, profile_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          profile_json=excluded.profile_json,
+          updated_at=excluded.updated_at
+        """,
+        (user_id, payload, now, now),
+    )
+    conn.commit()
+    return profile
