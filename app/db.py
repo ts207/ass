@@ -27,8 +27,9 @@ def _fts_query(user_query: str) -> str:
 
 def chatgpt_fts_candidates(conn, query: str, agent: str, limit: int = 100) -> List[Dict[str, Any]]:
     q = _fts_query(query)
-    if not q:
+    if not q or limit <= 0:
         return []
+    raw_limit = min(max(limit * 5, limit), 5000)
     rows = conn.execute(
         """
         SELECT node_id, conversation_id
@@ -37,9 +38,19 @@ def chatgpt_fts_candidates(conn, query: str, agent: str, limit: int = 100) -> Li
           AND (? = 'general' OR agent = ? OR agent = 'general')
         LIMIT ?
         """,
-        (q, agent, agent, limit),
+        (q, agent, agent, raw_limit),
     ).fetchall()
-    return [{"node_id": r[0], "conversation_id": r[1]} for r in rows]
+    out: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for r in rows:
+        node_id = r[0]
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        out.append({"node_id": node_id, "conversation_id": r[1]})
+        if len(out) >= limit:
+            break
+    return out
 
 
 def chatgpt_get_embeddings(conn, node_ids: List[str]) -> Dict[str, Any]:

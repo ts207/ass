@@ -221,9 +221,13 @@ def import_export(
     node_count = 0
     msg_node_count = 0
     fts_count = 0
+    inserted_fts: set[str] = set()
 
     # One transaction for speed
     cur.execute("BEGIN")
+    # FTS5 tables don't enforce uniqueness on node_id; repeated imports will accumulate duplicates.
+    # Rebuild the FTS index each run to keep retrieval accurate and fast.
+    cur.execute("DELETE FROM chatgpt_nodes_fts")
 
     for conv in conversations:
         conv_id = conv.get("id")
@@ -322,23 +326,37 @@ def import_export(
             if is_msg:
                 msg_node_count += 1
                 # Index only real message nodes (reduces noise)
+                # FTS5 doesn't enforce uniqueness on node_id; handle rare collisions defensively.
+                if nid in inserted_fts:
+                    cur.execute("DELETE FROM chatgpt_nodes_fts WHERE node_id = ?", (nid,))
                 cur.execute(
                     """
-                    INSERT OR REPLACE INTO chatgpt_nodes_fts
+                    INSERT INTO chatgpt_nodes_fts
                       (node_id, conversation_id, title, agent, text)
                     VALUES (?, ?, ?, ?, ?)
                     """,
                     (nid, conv_id, title, agent, text),
                 )
+                inserted_fts.add(nid)
                 fts_count += 1
 
     cur.execute("COMMIT")
 
+    # Print final counts from DB (more reliable across re-imports and node_id collisions).
+    row = conn.execute(
+        """
+        SELECT
+          (SELECT COUNT(*) FROM chatgpt_conversations),
+          (SELECT COUNT(*) FROM chatgpt_nodes),
+          (SELECT COUNT(*) FROM chatgpt_nodes WHERE is_message=1),
+          (SELECT COUNT(*) FROM chatgpt_nodes_fts)
+        """
+    ).fetchone()
     print("IMPORT COMPLETE")
-    print(f"  conversations: {conv_count}")
-    print(f"  nodes total:   {node_count}")
-    print(f"  msg nodes:     {msg_node_count}")
-    print(f"  fts rows:      {fts_count}")
+    print(f"  conversations: {row[0]}")
+    print(f"  nodes total:   {row[1]}")
+    print(f"  msg nodes:     {row[2]}")
+    print(f"  fts rows:      {row[3]}")
 
 
 def main():
