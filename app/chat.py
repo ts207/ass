@@ -33,7 +33,7 @@ from .db import (
     get_user_profile,
 )
 from .tool_loop import run_with_tools
-from .tool_schemas import LIFE_TOOLS, DS_TOOLS
+from .tool_schemas import LIFE_TOOLS, HEALTH_TOOLS, DS_TOOLS, CODE_TOOLS
 from .token_utils import try_get_encoding, count_message_tokens, token_len, truncate_to_tokens
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
@@ -47,7 +47,7 @@ def split_prefixed_requests(s: str):
     """
     import re
 
-    pattern = re.compile(r"\\b(life|ds|code):", re.IGNORECASE)
+    pattern = re.compile(r"\b(life|health|ds|code):", re.IGNORECASE)
     matches = list(pattern.finditer(s))
     if not matches:
         return [("life", s.strip())] if s.strip() else []
@@ -59,8 +59,7 @@ def split_prefixed_requests(s: str):
         end = matches[i + 1].start() if i + 1 < len(matches) else len(s)
         chunk = s[start:end].strip(" ;,")
         if chunk:
-            mapped = "ds" if agent in ("ds", "code") else "life"
-            pieces.append((mapped, chunk.strip()))
+            pieces.append((agent, chunk.strip()))
     return pieces
 
 
@@ -355,7 +354,14 @@ def main():
                     agent_convo = create_conversation(conn, user_id, title=f"{display_agent} thread")
                     set_agent_conversation_id(conn, user_id, agent, agent_convo)
 
-                tools_schema = LIFE_TOOLS if agent == "life" else DS_TOOLS
+                if agent == "life":
+                    tools_schema = LIFE_TOOLS
+                elif agent == "health":
+                    tools_schema = HEALTH_TOOLS
+                elif agent == "code":
+                    tools_schema = CODE_TOOLS
+                else:
+                    tools_schema = DS_TOOLS
                 profile = get_user_profile(conn, user_id)
                 tz = ""
                 if isinstance(profile.get("timezone"), str):
@@ -364,15 +370,30 @@ def main():
                     tz = profile["tz"].strip()
                 if not tz:
                     tz = "Asia/Ulaanbaatar"
-                system_instructions = (
-                    f"You are the Life Manager. User timezone: {tz}. "
-                    "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
-                    "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
-                    if agent == "life"
-                    else
-                    "You are a Data Science Course Assistant. You can design short courses, serve lessons, grade submissions, and adapt the plan based on progress. "
-                    "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
-                )
+                if agent == "life":
+                    system_instructions = (
+                        f"You are the Life Manager. User timezone: {tz}. "
+                        "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
+                        "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
+                    )
+                elif agent == "health":
+                    system_instructions = (
+                        f"You are the Health assistant. User timezone: {tz}. "
+                        "You are not a doctor; give general, evidence-based guidance and encourage professional help for urgent symptoms. "
+                        "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
+                        "If the user explicitly asks to save/update stable facts (timezone, conditions, meds, preferences, goals), call set_profile."
+                    )
+                elif agent == "code":
+                    system_instructions = (
+                        "You are the Coding assistant. Help with debugging, architecture, and implementation details. "
+                        "When useful, log progress with code_record_progress and review history with code_list_progress. "
+                        "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
+                    )
+                else:
+                    system_instructions = (
+                        "You are a Data Science Course Assistant. You can design short courses, serve lessons, grade submissions, and adapt the plan based on progress. "
+                        "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
+                    )
 
                 if profile:
                     profile_blob = json.dumps(profile, ensure_ascii=False, indent=2)
@@ -392,7 +413,7 @@ def main():
                     mem_results: list[dict] = []
                     seen_nodes: set[str] = set()
                     variants = _query_variants(text, enc)
-                    agent_tags = [agent] if agent in ("life", "ds") else ["general"]
+                    agent_tags = [agent] if agent in ("life", "health", "ds", "code") else ["general"]
 
                     # Keep this bounded; don't spam the API.
                     for agent_tag in agent_tags:

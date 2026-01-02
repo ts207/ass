@@ -341,18 +341,31 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         except Exception:
             continue
 
-    # Agent session table migration: normalize legacy agent names to ds and refresh constraint
+    # Agent session table migration: refresh constraint and normalize legacy agent names
     try:
         existing_sql = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_sessions'"
         ).fetchone()
-        needs_upgrade = existing_sql and ("'cyber'" in existing_sql["sql"] or "'ds'" not in existing_sql["sql"])
+        desired = ("life", "ds", "health", "code")
+        existing_stmt = ""
+        if existing_sql:
+            try:
+                existing_stmt = existing_sql["sql"] or ""
+            except Exception:
+                try:
+                    existing_stmt = existing_sql[0] or ""
+                except Exception:
+                    existing_stmt = ""
+        needs_upgrade = bool(existing_stmt) and (
+            ("'cyber'" in existing_stmt)
+            or any(f"'{a}'" not in existing_stmt for a in desired)
+        )
         if needs_upgrade:
             conn.execute("ALTER TABLE agent_sessions RENAME TO agent_sessions_old")
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS agent_sessions ("
                 "user_id TEXT NOT NULL, "
-                "agent_name TEXT NOT NULL CHECK(agent_name IN ('life','ds')), "
+                "agent_name TEXT NOT NULL CHECK(agent_name IN ('life','ds','health','code')), "
                 "conversation_id TEXT NOT NULL, "
                 "updated_at TEXT NOT NULL, "
                 "PRIMARY KEY (user_id, agent_name))"
@@ -360,7 +373,12 @@ def run_migrations(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "INSERT OR REPLACE INTO agent_sessions (user_id, agent_name, conversation_id, updated_at) "
                 "SELECT user_id, "
-                "CASE WHEN agent_name IN ('cyber','code') THEN 'ds' ELSE agent_name END, "
+                "CASE "
+                "WHEN agent_name = 'cyber' THEN 'code' "
+                "WHEN agent_name = 'code' THEN 'code' "
+                "WHEN agent_name IN ('life','ds','health') THEN agent_name "
+                "ELSE 'life' "
+                "END, "
                 "conversation_id, updated_at FROM agent_sessions_old"
             )
             conn.execute("DROP TABLE agent_sessions_old")

@@ -15,9 +15,19 @@ from app.config import (
     MEMORY_INJECT_CANDIDATE_LIMIT,
     PROFILE_INJECT_MAX_TOKENS,
 )
-from app.db import connect, init_db, run_migrations, get_recent_messages, add_message, create_conversation, get_user_profile
+from app.db import (
+    connect,
+    init_db,
+    run_migrations,
+    get_recent_messages,
+    add_message,
+    create_conversation,
+    get_user_profile,
+    get_agent_conversation_id,
+    set_agent_conversation_id,
+)
 from app.tool_loop import run_with_tools
-from app.tool_schemas import LIFE_TOOLS, DS_TOOLS
+from app.tool_schemas import LIFE_TOOLS, HEALTH_TOOLS, DS_TOOLS, CODE_TOOLS
 from app.token_utils import try_get_encoding, count_message_tokens, token_len, truncate_to_tokens
 
 SCHEMA_PATH = Path("app/schema.sql")
@@ -164,18 +174,35 @@ conn = get_conn()
 user_id = "local_user"
 
 # --- session state ---
-if "convo_id" not in st.session_state:
-    st.session_state.convo_id = create_conversation(conn, user_id, title="Streamlit chat")
-
 if "agent" not in st.session_state:
     st.session_state.agent = "life"
+
+if "convo_id" not in st.session_state:
+    agent_convo = get_agent_conversation_id(conn, user_id, st.session_state.agent)
+    if not agent_convo:
+        agent_convo = create_conversation(conn, user_id, title=f"{st.session_state.agent} thread")
+        set_agent_conversation_id(conn, user_id, st.session_state.agent, agent_convo)
+    st.session_state.convo_id = agent_convo
 
 # --- sidebar ---
 with st.sidebar:
     st.header("Controls")
-    st.session_state.agent = st.selectbox("Agent", ["life", "ds"], index=0)  # change to ["life","ds"] if needed
+    selected_agent = st.selectbox("Agent", ["life", "health", "ds", "code"], index=0)
+    if selected_agent != st.session_state.agent:
+        st.session_state.agent = selected_agent
+    # keep a separate conversation thread per agent
+    agent_convo = get_agent_conversation_id(conn, user_id, st.session_state.agent)
+    if not agent_convo:
+        agent_convo = create_conversation(conn, user_id, title=f"{st.session_state.agent} thread")
+        set_agent_conversation_id(conn, user_id, st.session_state.agent, agent_convo)
+    if st.session_state.convo_id != agent_convo:
+        st.session_state.convo_id = agent_convo
+        st.rerun()
+
     if st.button("New conversation"):
-        st.session_state.convo_id = create_conversation(conn, user_id, title="Streamlit chat")
+        new_id = create_conversation(conn, user_id, title=f"{st.session_state.agent} thread")
+        set_agent_conversation_id(conn, user_id, st.session_state.agent, new_id)
+        st.session_state.convo_id = new_id
         st.rerun()
 
     st.caption(f"Conversation: {st.session_state.convo_id}")
@@ -193,7 +220,14 @@ for m in history:
 prompt = st.chat_input("Type a message…")
 if prompt:
     agent = st.session_state.agent
-    tools_schema = LIFE_TOOLS if agent == "life" else DS_TOOLS
+    if agent == "life":
+        tools_schema = LIFE_TOOLS
+    elif agent == "health":
+        tools_schema = HEALTH_TOOLS
+    elif agent == "code":
+        tools_schema = CODE_TOOLS
+    else:
+        tools_schema = DS_TOOLS
 
     profile = get_user_profile(conn, user_id)
     tz = ""
@@ -203,15 +237,30 @@ if prompt:
         tz = profile["tz"].strip()
     if not tz:
         tz = "Asia/Ulaanbaatar"
-    system_instructions = (
-        f"You are the Life Manager. User timezone: {tz}. "
-        "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
-        "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
-        if agent == "life"
-        else
-        "You are the Applied Data Science Tutor and assistant. Focus on data data analysis lab-based learning. "
-        "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
-    )
+    if agent == "life":
+        system_instructions = (
+            f"You are the Life Manager. User timezone: {tz}. "
+            "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
+            "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
+        )
+    elif agent == "health":
+        system_instructions = (
+            f"You are the Health assistant. User timezone: {tz}. "
+            "You are not a doctor; give general, evidence-based guidance and encourage professional help for urgent symptoms. "
+            "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
+            "If the user explicitly asks to save/update stable facts (timezone, conditions, meds, preferences, goals), call set_profile."
+        )
+    elif agent == "code":
+        system_instructions = (
+            "You are the Coding assistant. Help with debugging, architecture, and implementation details. "
+            "When useful, log progress with code_record_progress and review history with code_list_progress. "
+            "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
+        )
+    else:
+        system_instructions = (
+            "You are the Applied Data Science Tutor and assistant. Focus on lab-based learning. "
+            "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
+        )
 
     if profile:
         profile_blob = json.dumps(profile, ensure_ascii=False, indent=2)
@@ -230,7 +279,7 @@ if prompt:
         mem_results = []
         seen_nodes = set()
         variants = _query_variants(prompt)
-        agent_tags = [agent] if agent in ("life", "ds") else ["general"]
+        agent_tags = [agent] if agent in ("life", "health", "ds", "code") else ["general"]
 
         for agent_tag in agent_tags:
             for q in variants[:2]:

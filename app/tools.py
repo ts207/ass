@@ -44,6 +44,37 @@ def list_reminders(conn, user_id: str, limit: int = 10):
     return {"reminders": [dict(r) for r in rows]}
 
 
+def code_record_progress(
+    conn,
+    user_id: str,
+    topic: str,
+    notes: str | None = None,
+    evidence_path: str | None = None,
+) -> Dict[str, Any]:
+    pid = _id("code")
+    now = _now_iso()
+    conn.execute(
+        "INSERT INTO code_progress (id,user_id,topic,notes,evidence_path,created_at) VALUES (?,?,?,?,?,?)",
+        (pid, user_id, topic, notes or "", evidence_path, now),
+    )
+    conn.commit()
+    return {
+        "id": pid,
+        "topic": topic,
+        "notes": notes or "",
+        "evidence_path": evidence_path,
+        "created_at": now,
+    }
+
+
+def code_list_progress(conn, user_id: str, limit: int = 10) -> Dict[str, Any]:
+    rows = conn.execute(
+        "SELECT topic, notes, evidence_path, created_at FROM code_progress WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+        (user_id, limit),
+    ).fetchall()
+    return {"entries": [dict(r) for r in rows]}
+
+
 def ds_create_course(conn, user_id: str, goal: str, level: str, constraints: str | None = None) -> Dict[str, Any]:
     cid = _id("course")
     now = _now_iso()
@@ -242,7 +273,13 @@ def _embed_query(text: str) -> np.ndarray:
 
 def memory_search_graph_tool(conn, query: str, agent: str, k: int = 5, candidate_limit: int = 100,
                              context_up: int = 6, context_down: int = 4, use_embeddings: bool = True):
-    cands = chatgpt_fts_candidates(conn, query=query, agent=agent, limit=candidate_limit)
+    agent_tag = agent
+    if agent_tag == "health":
+        agent_tag = "life"
+    elif agent_tag == "code":
+        agent_tag = "ds"
+
+    cands = chatgpt_fts_candidates(conn, query=query, agent=agent_tag, limit=candidate_limit)
 
     # Deduplicate by node_id while preserving order
     seen = set()

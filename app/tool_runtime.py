@@ -67,6 +67,24 @@ def call_tool(name: str, args: Dict[str, Any], *, conn, user_id: str) -> str:
             )
             return json.dumps(out, ensure_ascii=False)
 
+        if name == "code_record_progress":
+            out = t.code_record_progress(
+                conn,
+                user_id=user_id,
+                topic=args["topic"],
+                notes=args.get("notes"),
+                evidence_path=args.get("evidence_path"),
+            )
+            return json.dumps(out, ensure_ascii=False)
+
+        if name == "code_list_progress":
+            out = t.code_list_progress(
+                conn,
+                user_id=user_id,
+                limit=int(args.get("limit", 10)),
+            )
+            return json.dumps(out, ensure_ascii=False)
+
         if name == "memory_search_graph":
             use_embeddings_val = args.get("use_embeddings", True)
             if isinstance(use_embeddings_val, str):

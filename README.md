@@ -26,6 +26,17 @@ python -m app.chat
 streamlit run ui_streamlit.py
 ```
 
+## Agents
+
+Use prefixes (you can combine multiple in one line):
+
+```text
+life: list reminders
+health: help me build a sleep routine
+ds: quiz me on train/test split
+code: help debug this traceback
+```
+
 ## ChatGPT Export Memory (Graph + Hybrid Search)
 
 This imports `conversations.json` or `chat.html` as a **lossless conversation graph**, builds an SQLite **FTS5** index, and optionally reranks FTS results using OpenAI **embeddings**.

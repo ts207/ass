@@ -50,7 +50,7 @@ CREATE INDEX IF NOT EXISTS idx_code_user_time
 ON code_progress(user_id, created_at);
 CREATE TABLE IF NOT EXISTS agent_sessions (
   user_id TEXT NOT NULL,
-  agent_name TEXT NOT NULL CHECK(agent_name IN ('life','ds')),
+  agent_name TEXT NOT NULL CHECK(agent_name IN ('life','ds','health','code')),
   conversation_id TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (user_id, agent_name)

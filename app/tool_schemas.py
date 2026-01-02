@@ -8,7 +8,7 @@ memory_search_graph = {
         "type": "object",
         "properties": {
             "query": {"type": "string"},
-            "agent": {"type": "string", "enum": ["life", "ds", "general"]},
+            "agent": {"type": "string", "enum": ["life", "health", "ds", "code", "general"]},
             "k": {"type": "integer", "default": 5, "minimum": 1, "maximum": 10},
             "candidate_limit": {"type": "integer", "default": 100, "minimum": 10, "maximum": 500},
             "context_up": {"type": "integer", "default": 6, "minimum": 0, "maximum": 30},
@@ -16,6 +16,34 @@ memory_search_graph = {
             "use_embeddings": {"type": "boolean", "default": True},
         },
         "required": ["query", "agent"],
+    },
+}
+
+code_record_progress = {
+    "type": "function",
+    "name": "code_record_progress",
+    "description": "Log coding/dev progress for the user (stored locally).",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "topic": {"type": "string"},
+            "notes": {"type": "string"},
+            "evidence_path": {"type": "string"},
+        },
+        "required": ["topic"],
+    },
+}
+
+code_list_progress = {
+    "type": "function",
+    "name": "code_list_progress",
+    "description": "List recent coding/dev progress entries.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "default": 10, "minimum": 1, "maximum": 50},
+        },
+        "required": [],
     },
 }
 
@@ -76,6 +104,13 @@ LIFE_TOOLS = [
             "required": [],
         },
     },
+    memory_search_graph,
+    set_profile,
+]
+
+HEALTH_TOOLS = [
+    LIFE_TOOLS[0],
+    LIFE_TOOLS[1],
     memory_search_graph,
     set_profile,
 ]
@@ -147,6 +182,15 @@ DS_TOOLS = [
             "required": ["topic"],
         },
     },
+    memory_search_graph,
+    set_profile,
+]
+
+CODE_TOOLS = [
+    LIFE_TOOLS[0],
+    LIFE_TOOLS[1],
+    code_record_progress,
+    code_list_progress,
     memory_search_graph,
     set_profile,
 ]
