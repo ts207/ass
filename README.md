@@ -51,6 +51,18 @@ docker run --rm -it -e OPENAI_API_KEY=sk-REPLACE ass python -m app.chat
 
 Mount `data/` as a volume if you want persistence outside the container.
 
+### Telegram Bot (chat + reminders to your phone)
+1) Create a bot via @BotFather and grab the token; find your user id (e.g. via @userinfobot).
+2) Add to `.env`:
+   ```
+   TELEGRAM_BOT_TOKEN=123:abc
+   TELEGRAM_ALLOWED_USER_IDS=12345678             # optional, comma-separated allowlist
+   TELEGRAM_DEFAULT_CHAT_ID=12345678              # where reminders go if the bot has not seen a chat yet
+   ```
+3) Install deps (`pip install -r requirements.txt`) then run: `python -m app.telegram_bot`
+4) In Telegram, DM the bot `/start` then chat normally (e.g., `general: plan my week`, `life: remind me at 8am to take meds`).
+5) Keep the bot process running (systemd or tmux) so reminders can be pushed to Telegram; it uses long polling (no public webhook needed).
+
 ## First-Time Setup Checklist
 - [ ] Create and activate venv: `python3 -m venv .venv && source .venv/bin/activate`
 - [ ] Install deps: `pip install -U pip && pip install -r requirements.txt`

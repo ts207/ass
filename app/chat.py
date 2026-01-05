@@ -224,7 +224,7 @@ def check_due_reminders(conn, *, debug: bool = False):
     now = _utcnow()
     now_iso = now.isoformat()
     rows = conn.execute(
-        "SELECT id, title, due_at, due_at_utc FROM reminders "
+        "SELECT id, user_id, title, due_at, due_at_utc FROM reminders "
         "WHERE status='scheduled' AND (due_at_utc IS NULL OR due_at_utc<=?)",
         (now_iso,),
     ).fetchall()
