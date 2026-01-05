@@ -1,0 +1,24 @@
+[Unit]
+Description=Local Assistant CLI
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/USER/ass
+ExecStart=/home/USER/ass/.venv/bin/python -m app.chat
+Environment=OPENAI_API_KEY=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
+# Optional: SMTP/IMAP for email
+# Environment=SMTP_HOST=...
+# Environment=SMTP_USER=...
+# Environment=SMTP_PASS=...
+# Environment=SMTP_FROM=...
+# Environment=IMAP_HOST=...
+# Environment=IMAP_USER=...
+# Environment=IMAP_PASS=...
+Restart=on-failure
+User=USER
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

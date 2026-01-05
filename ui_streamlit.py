@@ -2,7 +2,6 @@ import streamlit as st
 from openai import OpenAI
 import json
 from pathlib import Path
-import re
 
 from app.config import (
     DB_PATH,
@@ -27,7 +26,8 @@ from app.db import (
     set_agent_conversation_id,
 )
 from app.tool_loop import run_with_tools
-from app.tool_schemas import LIFE_TOOLS, HEALTH_TOOLS, DS_TOOLS, CODE_TOOLS
+from app.tool_runtime import call_tool
+from app.tool_schemas import LIFE_TOOLS, HEALTH_TOOLS, DS_TOOLS, CODE_TOOLS, GENERAL_TOOLS
 from app.token_utils import try_get_encoding, count_message_tokens, token_len, truncate_to_tokens
 
 SCHEMA_PATH = Path("app/schema.sql")
@@ -85,6 +85,7 @@ def _call_with_context_retry(*, client, model, tools_schema, input_items, conn, 
             conn=conn,
             user_id=user_id,
             debug=False,
+            call_tool_fn=call_tool,
         )
     except Exception as e:
         if "context_length_exceeded" not in str(e):
@@ -108,14 +109,9 @@ def _call_with_context_retry(*, client, model, tools_schema, input_items, conn, 
             conn=conn,
             user_id=user_id,
             debug=False,
+            call_tool_fn=call_tool,
         )
 
-
-_STOPWORDS = {
-    "the", "a", "an", "and", "or", "but", "if", "then", "else", "so", "to", "of", "in", "on", "at", "for", "from",
-    "with", "without", "is", "are", "was", "were", "be", "been", "being", "i", "you", "we", "they", "he", "she",
-    "it", "this", "that", "these", "those", "my", "your", "our", "their", "me", "him", "her", "them", "as",
-}
 
 _MEMORY_TRIGGERS = (
     "last time",
@@ -146,43 +142,6 @@ def _should_retrieve_memory(text: str) -> bool:
         return False
     return any(k in t for k in _MEMORY_TRIGGERS)
 
-
-def _query_variants(text: str) -> list[str]:
-    raw = (text or "").strip()
-    if not raw:
-        return []
-    variants = [raw]
-
-    if ENCODING is not None:
-        toks = ENCODING.encode(raw)
-        if len(toks) > 80:
-            variants.append(ENCODING.decode(toks[:80]))
-    else:
-        if len(raw) > 400:
-            variants.append(raw[:400])
-
-    words = re.findall(r"[A-Za-z0-9_']{3,}", raw.lower())
-    seen = set()
-    kept = []
-    for w in words:
-        if w in _STOPWORDS:
-            continue
-        if w in seen:
-            continue
-        seen.add(w)
-        kept.append(w)
-        if len(kept) >= 10:
-            break
-    if kept:
-        variants.append(" ".join(kept))
-
-    out = []
-    for v in variants:
-        v = v.strip()
-        if v and v not in out:
-            out.append(v)
-    return out
-
 st.set_page_config(page_title="Assistant", layout="wide")
 st.title("Assistant UI")
 
@@ -204,7 +163,7 @@ user_id = "local_user"
 
 # --- session state ---
 if "agent" not in st.session_state:
-    st.session_state.agent = "life"
+    st.session_state.agent = "general"
 
 if "convo_id" not in st.session_state:
     agent_convo = get_agent_conversation_id(conn, user_id, st.session_state.agent)
@@ -216,7 +175,7 @@ if "convo_id" not in st.session_state:
 # --- sidebar ---
 with st.sidebar:
     st.header("Controls")
-    selected_agent = st.selectbox("Agent", ["life", "health", "ds", "code"], index=0)
+    selected_agent = st.selectbox("Agent", ["general", "life", "health", "ds", "code"], index=0)
     if selected_agent != st.session_state.agent:
         st.session_state.agent = selected_agent
     # keep a separate conversation thread per agent
@@ -235,6 +194,29 @@ with st.sidebar:
         st.rerun()
 
     st.caption(f"Conversation: {st.session_state.convo_id}")
+
+    st.divider()
+    st.subheader("Permissions")
+    from app.tools import permissions_get, permissions_set
+
+    current_perms = permissions_get(conn, user_id=user_id)["permissions"]
+    perm_mode = st.selectbox("Mode", ["read", "write"], index=1 if current_perms.get("mode") == "write" else 0, key="perm_mode")
+    perm_allow_network = st.checkbox("Allow network tools", value=bool(current_perms.get("allow_network")), key="perm_allow_network")
+    perm_allow_fs = st.checkbox("Allow filesystem writes", value=bool(current_perms.get("allow_fs_write")), key="perm_allow_fs_write")
+    perm_allow_shell = st.checkbox("Allow shell commands", value=bool(current_perms.get("allow_shell")), key="perm_allow_shell")
+    perm_allow_exec = st.checkbox("Allow code execution", value=bool(current_perms.get("allow_exec")), key="perm_allow_exec")
+    if st.button("Save permissions"):
+        permissions_set(
+            conn,
+            user_id=user_id,
+            mode=perm_mode,
+            allow_network=perm_allow_network,
+            allow_fs_write=perm_allow_fs,
+            allow_shell=perm_allow_shell,
+            allow_exec=perm_allow_exec,
+        )
+        st.rerun()
+
     with st.expander("Memory used", expanded=False):
         dbg = st.session_state.get("last_memory_debug")
         if not dbg:
@@ -271,6 +253,8 @@ if prompt:
         tools_schema = HEALTH_TOOLS
     elif agent == "code":
         tools_schema = CODE_TOOLS
+    elif agent == "general":
+        tools_schema = GENERAL_TOOLS
     else:
         tools_schema = DS_TOOLS
 
@@ -287,6 +271,7 @@ if prompt:
             f"You are the Life Manager. User timezone: {tz}. "
             "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
             "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
+            "If a tool errors due to permissions, ask the user to toggle Permissions in the sidebar."
             "\n\nMemory policy: If the user references past context or asks for personalization/continuation, call memory_search_graph before answering. "
             "Use k=5 candidate_limit=250 context_up=4 context_down=2. "
             "Life query format: <goal/symptom> <routine> <constraint> <timeframe>."
@@ -297,6 +282,7 @@ if prompt:
             "You are not a doctor; give general, evidence-based guidance and encourage professional help for urgent symptoms. "
             "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
             "If the user explicitly asks to save/update stable facts (timezone, conditions, meds, preferences, goals), call set_profile."
+            "If a tool errors due to permissions, ask the user to toggle Permissions in the sidebar."
             "\n\nMemory policy: If the user references past symptoms, treatments, labs, routines, or asks to continue a plan, call memory_search_graph before answering. "
             "Use k=5 candidate_limit=250 context_up=4 context_down=2. "
             "Health query format: <symptom/goal> <med/supplement/routine> <constraint> <timeframe>."
@@ -306,14 +292,24 @@ if prompt:
             "You are the Coding assistant. Help with debugging, architecture, and implementation details. "
             "When useful, log progress with code_record_progress and review history with code_list_progress. "
             "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
+            "If a tool errors due to permissions, ask the user to toggle Permissions in the sidebar."
             "\n\nMemory policy: If the user references prior debugging, ongoing work, or asks to continue, call memory_search_graph before answering. "
             "Use k=5 candidate_limit=250 context_up=6 context_down=2. "
             "Code query format: <language/tool> <error/problem> <file/module> <goal>."
+        )
+    elif agent == "general":
+        system_instructions = (
+            "You are the Coordinator (General) agent. Route specialized tasks to life/health/ds/code using delegate_agent. "
+            "Use your own tools (web_search, fetch_url, extract_text, kb_search) for research and summaries. "
+            "Prefer using web_search/fetch_url/extract_text when the user requests up-to-date info, and include URLs you used. "
+            "If a tool errors due to permissions, ask the user to toggle Permissions in the sidebar. "
+            "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
         )
     else:
         system_instructions = (
             "You are the Applied Data Science Tutor and assistant. Focus on lab-based learning. "
             "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
+            "If a tool errors due to permissions, ask the user to toggle Permissions in the sidebar."
             "\n\nMemory policy: If the user references past work, progress, or asks to continue, call memory_search_graph before answering. "
             "Use k=5 candidate_limit=250 context_up=6 context_down=2. "
             "DS query format: <topic> <error/problem> <library/tool> <outcome/goal>."

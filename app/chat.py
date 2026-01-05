@@ -33,7 +33,8 @@ from .db import (
     get_user_profile,
 )
 from .tool_loop import run_with_tools
-from .tool_schemas import LIFE_TOOLS, HEALTH_TOOLS, DS_TOOLS, CODE_TOOLS
+from .tool_runtime import call_tool
+from .tool_schemas import LIFE_TOOLS, HEALTH_TOOLS, DS_TOOLS, CODE_TOOLS, GENERAL_TOOLS
 from .token_utils import try_get_encoding, count_message_tokens, token_len, truncate_to_tokens
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
@@ -47,10 +48,10 @@ def split_prefixed_requests(s: str):
     """
     import re
 
-    pattern = re.compile(r"\b(life|health|ds|code):", re.IGNORECASE)
+    pattern = re.compile(r"\b(life|health|ds|code|general):", re.IGNORECASE)
     matches = list(pattern.finditer(s))
     if not matches:
-        return [("life", s.strip())] if s.strip() else []
+        return [("general", s.strip())] if s.strip() else []
 
     pieces = []
     for i, m in enumerate(matches):
@@ -170,12 +171,6 @@ def _format_memory_results(results: list[dict], *, max_chars: int = 6000) -> str
     return blob
 
 
-_STOPWORDS = {
-    "the", "a", "an", "and", "or", "but", "if", "then", "else", "so", "to", "of", "in", "on", "at", "for", "from",
-    "with", "without", "is", "are", "was", "were", "be", "been", "being", "i", "you", "we", "they", "he", "she",
-    "it", "this", "that", "these", "those", "my", "your", "our", "their", "me", "him", "her", "them", "as",
-}
-
 _MEMORY_TRIGGERS = (
     "last time",
     "previous",
@@ -204,46 +199,6 @@ def _should_retrieve_memory(text: str) -> bool:
     if not t:
         return False
     return any(k in t for k in _MEMORY_TRIGGERS)
-
-
-def _query_variants(text: str, enc) -> list[str]:
-    raw = (text or "").strip()
-    if not raw:
-        return []
-    variants: list[str] = [raw]
-
-    # Shortened variant (first ~80 tokens) to avoid over-specificity.
-    if enc is not None:
-        toks = enc.encode(raw)
-        if len(toks) > 80:
-            variants.append(enc.decode(toks[:80]))
-    else:
-        if len(raw) > 400:
-            variants.append(raw[:400])
-
-    # Keyword variant for better FTS recall.
-    words = re.findall(r"[A-Za-z0-9_']{3,}", raw.lower())
-    seen: set[str] = set()
-    kept: list[str] = []
-    for w in words:
-        if w in _STOPWORDS:
-            continue
-        if w in seen:
-            continue
-        seen.add(w)
-        kept.append(w)
-        if len(kept) >= 10:
-            break
-    if kept:
-        variants.append(" ".join(kept))
-
-    # Deduplicate while preserving order.
-    out: list[str] = []
-    for v in variants:
-        v = v.strip()
-        if v and v not in out:
-            out.append(v)
-    return out
 
 
 def _parse_args():
@@ -333,7 +288,7 @@ def main():
         convo_id = create_conversation(conn, user_id, title="CLI chat")
 
     print(f"Conversation: {convo_id}")
-    print("Commands: /new, /list, /use <id>, /exit")
+    print("Commands: /new, /list, /use <id>, /perm, /exit")
 
     stop_event, watcher_thread = start_reminder_watcher(DB_PATH, interval=args.reminder_interval, debug=debug)
 
@@ -361,13 +316,53 @@ def main():
             if user_text == "/selftest":
                 print("Try prompts:")
                 print("  life: remind me tomorrow at 9am to take meds")
+                print("  life: create a task to file taxes due next Friday")
                 print("  ds: create a short course on feature engineering for beginners")
                 print("  ds: next lesson for my course_id")
+                print("  general: web_search best time to visit japan")
                 continue
 
             if user_text.startswith("/use "):
                 convo_id = user_text.split(" ", 1)[1].strip()
                 print(f"Conversation: {convo_id}")
+                continue
+
+            if user_text.startswith("/perm"):
+                from app.tools import permissions_get, permissions_set
+
+                parts = user_text.split()
+                if len(parts) == 1:
+                    print(json.dumps(permissions_get(conn, user_id=user_id), ensure_ascii=False, indent=2))
+                    continue
+
+                existing = permissions_get(conn, user_id=user_id)["permissions"]
+                mode = existing.get("mode", "write")
+                if len(parts) == 2 and parts[1] in ("read", "write"):
+                    mode = parts[1]
+                    updated = permissions_set(conn, user_id=user_id, mode=mode)
+                    print(json.dumps(updated, ensure_ascii=False, indent=2))
+                    continue
+
+                if len(parts) == 3 and parts[2] in ("on", "off"):
+                    flag = parts[1].lower()
+                    val = parts[2] == "on"
+                    kwargs = {"mode": mode}
+                    if flag in ("net", "network"):
+                        kwargs["allow_network"] = val
+                    elif flag in ("fs", "files", "file"):
+                        kwargs["allow_fs_write"] = val
+                    elif flag in ("shell",):
+                        kwargs["allow_shell"] = val
+                    elif flag in ("exec", "python"):
+                        kwargs["allow_exec"] = val
+                    else:
+                        print("Usage: /perm [read|write] OR /perm {net|fs|shell|exec} {on|off} OR /perm")
+                        continue
+                    updated = permissions_set(conn, user_id=user_id, **kwargs)
+                    print(json.dumps(updated, ensure_ascii=False, indent=2))
+                    continue
+
+                print("Usage: /perm [read|write] OR /perm {net|fs|shell|exec} {on|off} OR /perm")
                 continue
 
             # --- handle one or more prefixed agent requests ---
@@ -389,6 +384,8 @@ def main():
                     tools_schema = HEALTH_TOOLS
                 elif agent == "code":
                     tools_schema = CODE_TOOLS
+                elif agent == "general":
+                    tools_schema = GENERAL_TOOLS
                 else:
                     tools_schema = DS_TOOLS
                 profile = get_user_profile(conn, user_id)
@@ -402,7 +399,9 @@ def main():
                 if agent == "life":
                     system_instructions = (
                         f"You are the Life Manager. User timezone: {tz}. "
+                        "You can manage calendar events, tasks, reminders, contacts, documents, and expenses using tools. "
                         "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
+                        "If a tool errors due to permissions, ask the user to enable it via /perm (e.g. /perm net on, /perm fs on, /perm shell on). "
                         "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
                         "\n\nMemory policy: If the user references past context or asks for personalization/continuation, call memory_search_graph before answering. "
                         "Use k=5 candidate_limit=250 context_up=4 context_down=2. "
@@ -413,7 +412,9 @@ def main():
                     system_instructions = (
                         f"You are the Health assistant. User timezone: {tz}. "
                         "You are not a doctor; give general, evidence-based guidance and encourage professional help for urgent symptoms. "
+                        "You can log metrics, meds schedules, appointments, meals, workouts, and screening forms using tools. "
                         "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
+                        "If a tool errors due to permissions, ask the user to enable it via /perm (e.g. /perm net on). "
                         "If the user explicitly asks to save/update stable facts (timezone, conditions, meds, preferences, goals), call set_profile."
                         "\n\nMemory policy: If the user references past symptoms, treatments, labs, routines, or asks to continue a plan, call memory_search_graph before answering. "
                         "Use k=5 candidate_limit=250 context_up=4 context_down=2. "
@@ -424,15 +425,27 @@ def main():
                     system_instructions = (
                         "You are the Coding assistant. Help with debugging, architecture, and implementation details. "
                         "When useful, log progress with code_record_progress and review history with code_list_progress. "
+                        "If explicitly enabled in permissions, you can search/read files and run safe repo commands via tools. "
+                        "If a tool errors due to permissions, ask the user to enable it via /perm (e.g. /perm shell on, /perm fs on). "
                         "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
                         "\n\nMemory policy: If the user references prior debugging, ongoing work, or asks to continue, call memory_search_graph before answering. "
                         "Use k=5 candidate_limit=250 context_up=6 context_down=2. "
                         "Code query format: <language/tool> <error/problem> <file/module> <goal>. "
                         "After retrieval: cite what you found and then propose the next concrete steps."
                     )
+                elif agent == "general":
+                    system_instructions = (
+                        "You are the Coordinator (General) agent. Route specialized tasks to life/health/ds/code using delegate_agent. "
+                        "Use your own tools (web_search, fetch_url, extract_text, kb_search) for research and summaries. "
+                        "Prefer using web_search/fetch_url/extract_text when the user requests up-to-date info, and include URLs you used. "
+                        "If a tool errors due to permissions, ask the user to enable it via /perm net on (and /perm write if needed). "
+                        "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
+                    )
                 else:
                     system_instructions = (
                         "You are a Data Science Course Assistant. You can design short courses, serve lessons, grade submissions, and adapt the plan based on progress. "
+                        "You can also query the local SQLite DB, upload files, and log experiment runs using tools. "
+                        "If a tool errors due to permissions, ask the user to enable it via /perm (e.g. /perm exec on for run_python). "
                         "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
                         "\n\nMemory policy: If the user references past work, progress, or asks to continue, call memory_search_graph before answering. "
                         "Use k=5 candidate_limit=250 context_up=6 context_down=2. "
@@ -533,6 +546,7 @@ def main():
                         conn=conn,
                         user_id=user_id,
                         debug=debug,
+                        call_tool_fn=call_tool,
                     )
                 except Exception as e:
                     # If we still overflow the model's context window, retry with a smaller budget and no memory injection.
@@ -558,6 +572,7 @@ def main():
                             conn=conn,
                             user_id=user_id,
                             debug=debug,
+                            call_tool_fn=call_tool,
                         )
                     else:
                         raise

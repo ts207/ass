@@ -2,8 +2,6 @@ import json
 from typing import Any, Dict, List, Tuple
 from openai import OpenAI
 
-from .tool_runtime import call_tool
-
 
 def _item_to_dict(item: Any) -> Dict[str, Any]:
     if isinstance(item, dict):
@@ -57,6 +55,7 @@ def run_with_tools(
     user_id: str,
     max_iters: int = 8,
     debug: bool = False,
+    call_tool_fn=None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     previous_response_id = None
     follow_up_input: List[Dict[str, Any]] = input_items
@@ -87,7 +86,10 @@ def run_with_tools(
             call_id = tc.get("call_id")
             args = _parse_tool_args(tc.get("arguments", "{}"), debug=debug)
 
-            result = call_tool(name, args, conn=conn, user_id=user_id)
+            if call_tool_fn is None:
+                from .tool_runtime import call_tool as _call_tool
+                call_tool_fn = _call_tool
+            result = call_tool_fn(name, args, conn=conn, user_id=user_id)
             if not isinstance(result, str):
                 result = json.dumps(result, ensure_ascii=False)
 
