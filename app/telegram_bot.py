@@ -89,6 +89,19 @@ def _parse_allowed_ids(raw: Optional[str]) -> Set[str]:
     return {p for p in parts if p}
 
 
+def _parse_default_chat_id(raw: Optional[str]) -> Optional[int]:
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid TELEGRAM_DEFAULT_CHAT_ID value %r; ignoring and treating as unset.",
+            raw,
+        )
+    return None
+
+
 def _chunk_message(text: str, *, limit: int = 3800) -> List[str]:
     if len(text) <= limit:
         return [text]
@@ -350,8 +363,7 @@ def main():
         raise SystemExit("Set TELEGRAM_BOT_TOKEN in your environment or .env file.")
 
     allowed_ids = _parse_allowed_ids(os.getenv("TELEGRAM_ALLOWED_USER_IDS"))
-    default_chat_id = os.getenv("TELEGRAM_DEFAULT_CHAT_ID")
-    default_chat_val: Optional[int] = int(default_chat_id) if default_chat_id else None
+    default_chat_val = _parse_default_chat_id(os.getenv("TELEGRAM_DEFAULT_CHAT_ID"))
 
     app = Application.builder().token(token).build()
     app.bot_data["allowed_ids"] = allowed_ids
