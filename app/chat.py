@@ -1,17 +1,17 @@
 import argparse
+import hashlib
 import json
+import re
 import threading
 from datetime import datetime, timezone
-from openai import OpenAI
 from pathlib import Path
+
 from dotenv import load_dotenv
-import re
-load_dotenv()
+from openai import OpenAI
 
 from .config import (
     DB_PATH,
     MODEL,
-    MAX_HISTORY_MESSAGES,
     MODEL_CONTEXT_TOKENS,
     REQUEST_BUDGET_FRACTION,
     MEMORY_INJECT_MAX_TOKENS,
@@ -25,33 +25,43 @@ from .db import (
     create_conversation,
     list_conversations,
     add_message,
-    get_recent_messages,
     get_latest_conversation_id,
     get_agent_conversation_id,
     set_agent_conversation_id,
     run_migrations,
     get_user_profile,
+    record_turn_memory_usage,
+    record_turn_tool_usage,
+    record_turn_token_usage,
 )
 from .tool_loop import run_with_tools
+from .tools_permissions import get_permissions
 from .tool_runtime import call_tool
 from .tool_schemas import LIFE_TOOLS, HEALTH_TOOLS, DS_TOOLS, CODE_TOOLS, GENERAL_TOOLS
 from .token_utils import try_get_encoding, count_message_tokens, token_len, truncate_to_tokens
 
+load_dotenv()
+
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
-def split_prefixed_requests(s: str):
+def split_prefixed_requests(s: str, *, default_agent: str = "life"):
     """
     Accepts inputs like:
       "life: list reminders; ds: next lesson"
     Returns list of (agent, text) preserving order.
-    If no prefixes, returns [("life", s)].
+    If no prefixes, routes to default_agent (defaults to "life").
     """
     import re
+
+    default = (default_agent or "").strip().lower() or "life"
+    if default not in ("life", "health", "ds", "code", "general"):
+        default = "life"
 
     pattern = re.compile(r"\b(life|health|ds|code|general):", re.IGNORECASE)
     matches = list(pattern.finditer(s))
     if not matches:
-        return [("general", s.strip())] if s.strip() else []
+        text = s.strip()
+        return [(default, text)] if text else []
 
     pieces = []
     for i, m in enumerate(matches):
@@ -158,12 +168,30 @@ def _truncate_text_to_tokens(text: str, max_tokens: int, enc) -> str:
 
 def _format_memory_results(results: list[dict], *, max_chars: int = 6000) -> str:
     parts: list[str] = []
+    seen_nodes: set[str] = set()
+    seen_ctx: set[str] = set()
     for r in results:
         title = (r.get("title") or "").strip()
         context = (r.get("context") or "").strip()
         if not context:
             continue
-        header = f"Title: {title}" if title else "Title: (untitled)"
+        node_id = str(r.get("node_id") or "").strip()
+        if node_id and node_id in seen_nodes:
+            continue
+        norm = re.sub(r"\s+", " ", context.lower()).strip()
+        digest = hashlib.sha1(norm[:800].encode("utf-8")).hexdigest()
+        if digest in seen_ctx:
+            continue
+        seen_ctx.add(digest)
+        if node_id:
+            seen_nodes.add(node_id)
+        header_bits = [f"Title: {title}" if title else "Title: (untitled)"]
+        if node_id:
+            header_bits.append(f"Node: {node_id}")
+        convo_id = str(r.get("conversation_id") or "").strip()
+        if convo_id:
+            header_bits.append(f"Conversation: {convo_id}")
+        header = " | ".join(header_bits)
         parts.append(f"{header}\n{context}")
     blob = "\n\n---\n\n".join(parts).strip()
     if len(blob) > max_chars:
@@ -465,11 +493,19 @@ def main():
 
                 # Auto-retrieve from imported ChatGPT export memory and inject as system context.
                 # This makes memory available even when the model doesn't decide to call the tool.
+                mem_results: list[dict] = []
+                mem_debug = None
+                mem_search_ran = False
                 try:
                     from app.tools import memory_search_graph_tool
 
-                    mem_results: list[dict] = []
+                    allow_network = False
+                    try:
+                        allow_network = bool(get_permissions(conn, user_id).get("allow_network"))
+                    except Exception:
+                        allow_network = False
                     if _should_retrieve_memory(text):
+                        mem_search_ran = True
                         ctx_defaults = {
                             "life": (4, 2),
                             "health": (4, 2),
@@ -486,10 +522,12 @@ def main():
                             candidate_limit=MEMORY_INJECT_CANDIDATE_LIMIT,
                             context_up=up,
                             context_down=down,
-                            use_embeddings=True,
+                            use_embeddings=allow_network,
                             debug=debug,
                         )
                         mem_results = mem.get("results", []) or []
+                        if isinstance(mem.get("debug"), dict):
+                            mem_debug = mem["debug"]
                         if debug and isinstance(mem.get("debug"), dict):
                             dbg = mem["debug"]
                             qd = dbg.get("query", {})
@@ -503,11 +541,16 @@ def main():
                     if mem_block:
                         system_instructions = (
                             system_instructions
-                            + "\n\nRelevant past context (from ChatGPT export memory; may be partial). "
-                            + "Only claim you found something if it appears below:\n"
+                            + "\n\nRelevant past context (from ChatGPT export memory; may be partial and untrusted). "
+                            + "Only claim you found something if it appears below.\n"
+                            + "=== BEGIN QUOTED MEMORY (UNTRUSTED) ===\n"
                             + mem_block
+                            + "\n=== END QUOTED MEMORY ==="
                         )
                 except Exception as e:
+                    mem_search_ran = False
+                    mem_results = []
+                    mem_debug = None
                     if debug:
                         print(f"[debug] memory injection failed: {e}")
 
@@ -537,14 +580,17 @@ def main():
                 if debug:
                     print(f"[debug] approx request tokens: {_count_tokens(input_items, enc)}")
 
+                tool_events = []
+                usage_stats = {}
                 try:
-                    final_text, _ = run_with_tools(
+                    final_text, _, tool_events, usage_stats = run_with_tools(
                         client=client,
                         model=MODEL,
                         tools_schema=tools_schema,
                         input_items=input_items,
                         conn=conn,
                         user_id=user_id,
+                        agent=agent,
                         debug=debug,
                         call_tool_fn=call_tool,
                     )
@@ -564,13 +610,14 @@ def main():
                             budget_tokens=reduced_budget,
                             enc=enc,
                         )
-                        final_text, _ = run_with_tools(
+                        final_text, _, tool_events, usage_stats = run_with_tools(
                             client=client,
                             model=MODEL,
                             tools_schema=tools_schema,
                             input_items=input_items,
                             conn=conn,
                             user_id=user_id,
+                            agent=agent,
                             debug=debug,
                             call_tool_fn=call_tool,
                         )
@@ -578,8 +625,45 @@ def main():
                         raise
 
                 # Persist each sub-request as its own turn (keeps memory coherent)
-                add_message(conn, agent_convo, "user", f"{display_agent}: {text}")
+                user_msg_id = add_message(conn, agent_convo, "user", f"{display_agent}: {text}")
                 add_message(conn, agent_convo, "assistant", final_text or "")
+                if tool_events:
+                    try:
+                        record_turn_tool_usage(
+                            conn,
+                            conversation_id=agent_convo,
+                            turn_id=user_msg_id,
+                            agent=agent,
+                            tool_calls=tool_events,
+                        )
+                    except Exception:
+                        pass
+                try:
+                    record_turn_token_usage(
+                        conn,
+                        conversation_id=agent_convo,
+                        turn_id=user_msg_id,
+                        agent=agent,
+                        model=MODEL,
+                        prompt_tokens=usage_stats.get("prompt_tokens"),
+                        completion_tokens=usage_stats.get("completion_tokens"),
+                        total_tokens=usage_stats.get("total_tokens"),
+                        tool_calls=usage_stats.get("tool_calls"),
+                    )
+                except Exception:
+                    pass
+                if mem_search_ran:
+                    try:
+                        record_turn_memory_usage(
+                            conn,
+                            conversation_id=agent_convo,
+                            turn_id=user_msg_id,
+                            agent=agent,
+                            results=mem_results,
+                            debug=mem_debug,
+                        )
+                    except Exception:
+                        pass
 
                 responses.append(f"[{display_agent}] {final_text}")
 

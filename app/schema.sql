@@ -207,6 +207,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
   result_json TEXT,
   status TEXT NOT NULL,
   error TEXT,
+  duration_ms INTEGER,
   created_at TEXT NOT NULL
 );
 
@@ -215,6 +216,89 @@ ON audit_log(user_id, created_at);
 
 CREATE INDEX IF NOT EXISTS idx_audit_tool_time
 ON audit_log(tool, created_at);
+
+-- =========================
+-- Turn Memory Usage (last-turn debug + UI)
+-- =========================
+CREATE TABLE IF NOT EXISTS turn_memory_usage (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  agent TEXT NOT NULL,
+  node_id TEXT,
+  rank INTEGER,
+  score REAL,
+  snippet TEXT,
+  meta_json TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_turn_memory_usage_convo_time
+ON turn_memory_usage(conversation_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_turn_memory_usage_turn
+ON turn_memory_usage(conversation_id, turn_id);
+
+-- =========================
+-- Turn Tool Usage (last-turn debug + audit)
+-- =========================
+CREATE TABLE IF NOT EXISTS turn_tool_usage (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  agent TEXT NOT NULL,
+  tool_name TEXT,
+  input_json TEXT,
+  output_json TEXT,
+  status TEXT NOT NULL,
+  error TEXT,
+  duration_ms INTEGER,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_turn_tool_usage_convo_time
+ON turn_tool_usage(conversation_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_turn_tool_usage_turn
+ON turn_tool_usage(conversation_id, turn_id);
+
+-- =========================
+-- Turn Token Usage (last-turn debug + audit)
+-- =========================
+CREATE TABLE IF NOT EXISTS turn_token_usage (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  agent TEXT NOT NULL,
+  model TEXT NOT NULL,
+  prompt_tokens INTEGER,
+  completion_tokens INTEGER,
+  total_tokens INTEGER,
+  tool_calls INTEGER,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_turn_token_usage_turn
+ON turn_token_usage(conversation_id, turn_id);
+
+-- =========================
+-- Tool Policies (scoped permissions)
+-- =========================
+CREATE TABLE IF NOT EXISTS tool_policies (
+  user_id TEXT NOT NULL,
+  agent TEXT NOT NULL,
+  tool_name TEXT NOT NULL,
+  allow INTEGER NOT NULL,
+  constraints_json TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (user_id, agent, tool_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_policies_user_agent
+ON tool_policies(user_id, agent);
 
 -- =========================
 -- Life Manager: calendar, tasks, contacts, docs, finance

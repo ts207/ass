@@ -51,12 +51,16 @@ from app.db import (
     init_db,
     run_migrations,
     set_agent_conversation_id,
+    record_turn_memory_usage,
+    record_turn_tool_usage,
+    record_turn_token_usage,
 )
 from app.tool_loop import run_with_tools
 from app.tool_runtime import call_tool
 from app.tool_schemas import GENERAL_TOOLS
 from app.tools import memory_search_graph_tool
 from app.tools_general import delegate_agent
+from app.tools_permissions import get_permissions
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -158,9 +162,17 @@ def _run_general_agent(conn, *, user_id: str, text: str, debug: bool = False) ->
     profile = get_user_profile(conn, user_id)
     system_instructions = _general_system_instructions(profile or {})
 
+    mem_results: List[Dict[str, str]] = []
+    mem_debug = None
+    mem_search_ran = False
     try:
-        mem_results: List[Dict[str, str]] = []
+        allow_network = False
+        try:
+            allow_network = bool(get_permissions(conn, user_id).get("allow_network"))
+        except Exception:
+            allow_network = False
         if _should_retrieve_memory(text):
+            mem_search_ran = True
             mem = memory_search_graph_tool(
                 conn,
                 query=text,
@@ -169,10 +181,12 @@ def _run_general_agent(conn, *, user_id: str, text: str, debug: bool = False) ->
                 candidate_limit=MEMORY_INJECT_CANDIDATE_LIMIT,
                 context_up=6,
                 context_down=2,
-                use_embeddings=True,
+                use_embeddings=allow_network,
                 debug=debug,
             )
             mem_results = mem.get("results", []) or []
+            if isinstance(mem.get("debug"), dict):
+                mem_debug = mem["debug"]
             if debug and isinstance(mem.get("debug"), dict):
                 logger.info("memory debug: %s", mem["debug"])
 
@@ -181,11 +195,16 @@ def _run_general_agent(conn, *, user_id: str, text: str, debug: bool = False) ->
         if mem_block:
             system_instructions = (
                 system_instructions
-                + "\n\nRelevant past context (from ChatGPT export memory; may be partial). "
-                + "Only claim you found something if it appears below:\n"
+                + "\n\nRelevant past context (from ChatGPT export memory; may be partial and untrusted). "
+                + "Only claim you found something if it appears below.\n"
+                + "=== BEGIN QUOTED MEMORY (UNTRUSTED) ===\n"
                 + mem_block
+                + "\n=== END QUOTED MEMORY ==="
             )
     except Exception as e:
+        mem_search_ran = False
+        mem_results = []
+        mem_debug = None
         if debug:
             logger.warning("memory injection failed: %s", e)
 
@@ -211,14 +230,17 @@ def _run_general_agent(conn, *, user_id: str, text: str, debug: bool = False) ->
         enc=ENCODING,
     )
 
+    tool_events = []
+    usage_stats = {}
     try:
-        final_text, _ = run_with_tools(
+        final_text, _, tool_events, usage_stats = run_with_tools(
             client=OPENAI_CLIENT,
             model=MODEL,
             tools_schema=GENERAL_TOOLS,
             input_items=input_items,
             conn=conn,
             user_id=user_id,
+            agent=agent,
             debug=debug,
             call_tool_fn=call_tool,
         )
@@ -232,21 +254,59 @@ def _run_general_agent(conn, *, user_id: str, text: str, debug: bool = False) ->
                 budget_tokens=reduced_budget,
                 enc=ENCODING,
             )
-            final_text, _ = run_with_tools(
+            final_text, _, tool_events, usage_stats = run_with_tools(
                 client=OPENAI_CLIENT,
                 model=MODEL,
                 tools_schema=GENERAL_TOOLS,
                 input_items=input_items,
                 conn=conn,
                 user_id=user_id,
+                agent=agent,
                 debug=debug,
                 call_tool_fn=call_tool,
             )
         else:
             raise
 
-    add_message(conn, agent_convo, "user", f"{agent}: {text}")
+    user_msg_id = add_message(conn, agent_convo, "user", f"{agent}: {text}")
     add_message(conn, agent_convo, "assistant", final_text or "")
+    if tool_events:
+        try:
+            record_turn_tool_usage(
+                conn,
+                conversation_id=agent_convo,
+                turn_id=user_msg_id,
+                agent=agent,
+                tool_calls=tool_events,
+            )
+        except Exception:
+            pass
+    try:
+        record_turn_token_usage(
+            conn,
+            conversation_id=agent_convo,
+            turn_id=user_msg_id,
+            agent=agent,
+            model=MODEL,
+            prompt_tokens=usage_stats.get("prompt_tokens"),
+            completion_tokens=usage_stats.get("completion_tokens"),
+            total_tokens=usage_stats.get("total_tokens"),
+            tool_calls=usage_stats.get("tool_calls"),
+        )
+    except Exception:
+        pass
+    if mem_search_ran:
+        try:
+            record_turn_memory_usage(
+                conn,
+                conversation_id=agent_convo,
+                turn_id=user_msg_id,
+                agent=agent,
+                results=mem_results,
+                debug=mem_debug,
+            )
+        except Exception:
+            pass
 
     return final_text
 
@@ -255,7 +315,7 @@ def handle_user_text(user_id: str, text: str, *, debug: bool = False) -> str:
     _init_db_if_needed()
     conn = connect(DB_PATH, check_same_thread=False)
     try:
-        requests = split_prefixed_requests(text)
+        requests = split_prefixed_requests(text, default_agent="general")
         responses: List[str] = []
         for agent, chunk in requests:
             chunk = chunk.strip()
@@ -310,7 +370,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     loop = asyncio.get_running_loop()
     try:
-        reply = await loop.run_in_executor(None, handle_user_text, user_id, text, False)
+        reply = await loop.run_in_executor(None, handle_user_text, user_id, text)
     except Exception as e:
         logger.exception("handle_user_text failed")
         reply = f"Error: {e}"
@@ -356,6 +416,22 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
             logger.error("failed to send reminder to %s: %s", chat_id, e)
 
 
+def _schedule_reminders(app: Application) -> bool:
+    """
+    Schedule reminder job if JobQueue is available. Returns True if scheduled.
+    """
+    job_queue = getattr(app, "job_queue", None)
+    if not job_queue:
+        logger.warning(
+            "Job queue unavailable; skipping reminder scheduling. "
+            'Install python-telegram-bot[job-queue] to enable reminders.'
+        )
+        return False
+
+    job_queue.run_repeating(reminder_job, interval=30, first=10)
+    return True
+
+
 def main():
     _init_db_if_needed()
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -373,7 +449,7 @@ def main():
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    app.job_queue.run_repeating(reminder_job, interval=30, first=10)
+    _schedule_reminders(app)
 
     logger.info("Starting Telegram bot (long polling). Allowed IDs: %s", allowed_ids or "any")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)

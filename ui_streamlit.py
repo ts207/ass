@@ -1,7 +1,10 @@
-import streamlit as st
-from openai import OpenAI
+import hashlib
 import json
 from pathlib import Path
+import re
+
+import streamlit as st
+from openai import OpenAI
 
 from app.config import (
     DB_PATH,
@@ -24,6 +27,13 @@ from app.db import (
     get_user_profile,
     get_agent_conversation_id,
     set_agent_conversation_id,
+    get_last_user_message_id,
+    get_turn_memory_usage,
+    record_turn_memory_usage,
+    get_turn_tool_usage,
+    record_turn_tool_usage,
+    get_turn_token_usage,
+    record_turn_token_usage,
 )
 from app.tool_loop import run_with_tools
 from app.tool_runtime import call_tool
@@ -62,12 +72,30 @@ def _truncate_text_to_tokens(text: str, max_tokens: int) -> str:
 
 def _format_memory_results(results, *, max_chars: int = 6000) -> str:
     parts = []
+    seen_nodes = set()
+    seen_ctx = set()
     for r in results or []:
         title = (r.get("title") or "").strip()
         context = (r.get("context") or "").strip()
         if not context:
             continue
-        header = f"Title: {title}" if title else "Title: (untitled)"
+        node_id = str(r.get("node_id") or "").strip()
+        if node_id and node_id in seen_nodes:
+            continue
+        norm = re.sub(r"\s+", " ", context.lower()).strip()
+        digest = hashlib.sha1(norm[:800].encode("utf-8")).hexdigest()
+        if digest in seen_ctx:
+            continue
+        seen_ctx.add(digest)
+        if node_id:
+            seen_nodes.add(node_id)
+        header_bits = [f"Title: {title}" if title else "Title: (untitled)"]
+        if node_id:
+            header_bits.append(f"Node: {node_id}")
+        convo_id = str(r.get("conversation_id") or "").strip()
+        if convo_id:
+            header_bits.append(f"Conversation: {convo_id}")
+        header = " | ".join(header_bits)
         parts.append(f"{header}\n{context}")
     blob = "\n\n---\n\n".join(parts).strip()
     if len(blob) > max_chars:
@@ -75,7 +103,7 @@ def _format_memory_results(results, *, max_chars: int = 6000) -> str:
     return blob
 
 
-def _call_with_context_retry(*, client, model, tools_schema, input_items, conn, user_id):
+def _call_with_context_retry(*, client, model, tools_schema, input_items, conn, user_id, agent: str):
     try:
         return run_with_tools(
             client=client,
@@ -84,6 +112,7 @@ def _call_with_context_retry(*, client, model, tools_schema, input_items, conn, 
             input_items=input_items,
             conn=conn,
             user_id=user_id,
+            agent=agent,
             debug=False,
             call_tool_fn=call_tool,
         )
@@ -108,6 +137,7 @@ def _call_with_context_retry(*, client, model, tools_schema, input_items, conn, 
             input_items=trimmed_items,
             conn=conn,
             user_id=user_id,
+            agent=agent,
             debug=False,
             call_tool_fn=call_tool,
         )
@@ -200,6 +230,7 @@ with st.sidebar:
     from app.tools import permissions_get, permissions_set
 
     current_perms = permissions_get(conn, user_id=user_id)["permissions"]
+    allow_network = bool(current_perms.get("allow_network"))
     perm_mode = st.selectbox("Mode", ["read", "write"], index=1 if current_perms.get("mode") == "write" else 0, key="perm_mode")
     perm_allow_network = st.checkbox("Allow network tools", value=bool(current_perms.get("allow_network")), key="perm_allow_network")
     perm_allow_fs = st.checkbox("Allow filesystem writes", value=bool(current_perms.get("allow_fs_write")), key="perm_allow_fs_write")
@@ -217,22 +248,105 @@ with st.sidebar:
         )
         st.rerun()
 
+    last_turn_id = get_last_user_message_id(conn, st.session_state.convo_id)
+    mem_usage = []
+    tool_usage = []
+    token_usage = None
+    if last_turn_id:
+        debug_conn = connect(DB_PATH)
+        try:
+            mem_usage = get_turn_memory_usage(debug_conn, st.session_state.convo_id, last_turn_id)
+            tool_usage = get_turn_tool_usage(debug_conn, st.session_state.convo_id, last_turn_id)
+            token_usage = get_turn_token_usage(debug_conn, st.session_state.convo_id, last_turn_id)
+        finally:
+            debug_conn.close()
+
     with st.expander("Memory used", expanded=False):
-        dbg = st.session_state.get("last_memory_debug")
-        if not dbg:
+        mem_items = [row for row in mem_usage if row.get("node_id")]
+        if not mem_usage:
             st.caption("No memory retrieval on the last turn.")
+        elif not mem_items:
+            st.caption("No memory snippets used on the last turn.")
         else:
-            q = dbg.get("query", {})
-            st.write(f"Query: `{q.get('raw')}`")
+            for row in mem_items[:3]:
+                meta = row.get("meta") or {}
+                title = meta.get("title") or "(untitled)"
+                st.write(f"- `{row.get('node_id')}` — {title}")
+                ctx = (row.get("snippet") or "").strip()
+                if ctx:
+                    st.caption(ctx[:300] + ("..." if len(ctx) > 300 else ""))
+
+    with st.expander("Memory debug (last turn)", expanded=False):
+        meta = {}
+        for row in mem_usage:
+            meta = row.get("meta") or {}
+            if meta:
+                break
+        if not meta:
+            if mem_usage:
+                st.caption("No debug details recorded for the last turn.")
+            else:
+                st.caption("No memory retrieval on the last turn.")
+        else:
+            q = meta.get("query") or {}
+            if q.get("raw"):
+                st.write(f"Query: `{q.get('raw')}`")
             if q.get("cleaned"):
                 st.write(f"Cleaned: `{q.get('cleaned')}`")
             if q.get("keywords"):
                 st.write(f"Keywords: `{', '.join(q.get('keywords'))}`")
-            for r in (dbg.get("top_results") or [])[:3]:
-                st.write(f"- `{r.get('node_id')}` — {r.get('title') or '(untitled)'}")
-                ctx = (r.get("context") or "").strip()
-                if ctx:
-                    st.caption(ctx[:300] + ("…" if len(ctx) > 300 else ""))
+            if meta.get("candidates") is not None:
+                st.write(f"Candidates: `{meta.get('candidates')}`")
+            if meta.get("used_embeddings") is not None:
+                st.write(f"Used embeddings: `{meta.get('used_embeddings')}`")
+            if meta.get("mmr_used") is not None:
+                st.write(f"MMR used: `{meta.get('mmr_used')}`")
+            if meta.get("mmr_lambda") is not None:
+                st.write(f"MMR lambda: `{meta.get('mmr_lambda')}`")
+            if meta.get("mmr_pool") is not None:
+                st.write(f"MMR pool: `{meta.get('mmr_pool')}`")
+
+    with st.expander("Tools used (last turn)", expanded=False):
+        if not tool_usage:
+            st.caption("No tool calls on the last turn.")
+        else:
+            for row in tool_usage:
+                tool_name = row.get("tool_name") or "(unknown)"
+                status = row.get("status") or "ok"
+                duration_ms = row.get("duration_ms")
+                header = f"{tool_name} — {status}"
+                if duration_ms is not None:
+                    header += f" ({duration_ms} ms)"
+                st.markdown(f"**{header}**")
+                if row.get("error"):
+                    st.caption(f"Error: {row.get('error')}")
+                input_preview = row.get("input")
+                if input_preview is not None:
+                    text = json.dumps(input_preview, ensure_ascii=False, indent=2)
+                    if len(text) > 2000:
+                        text = text[:2000].rstrip() + "\n[truncated]"
+                    st.code(text, language="json")
+                output_preview = row.get("output")
+                if output_preview is not None:
+                    text = json.dumps(output_preview, ensure_ascii=False, indent=2)
+                    if len(text) > 2000:
+                        text = text[:2000].rstrip() + "\n[truncated]"
+                    st.code(text, language="json")
+
+    with st.expander("Token/cost (last turn)", expanded=False):
+        if not token_usage:
+            st.caption("No token usage recorded for the last turn.")
+        else:
+            st.write(f"Model: `{token_usage.get('model')}`")
+            if token_usage.get("prompt_tokens") is not None:
+                st.write(f"Prompt tokens: `{token_usage.get('prompt_tokens')}`")
+            if token_usage.get("completion_tokens") is not None:
+                st.write(f"Completion tokens: `{token_usage.get('completion_tokens')}`")
+            if token_usage.get("total_tokens") is not None:
+                st.write(f"Total tokens: `{token_usage.get('total_tokens')}`")
+            if token_usage.get("tool_calls") is not None:
+                st.write(f"Tool calls: `{token_usage.get('tool_calls')}`")
+            st.caption("Cost estimate not configured.")
 
 # --- load and display history ---
 history = get_recent_messages(conn, st.session_state.convo_id, MAX_HISTORY_MESSAGES)
@@ -326,12 +440,14 @@ if prompt:
             )
 
     # Auto-retrieve from imported ChatGPT export memory and inject as system context.
+    mem_results = []
+    mem_debug = None
+    mem_search_ran = False
     try:
         from app.tools import memory_search_graph_tool
 
-        mem_results = []
-        st.session_state["last_memory_debug"] = None
         if _should_retrieve_memory(prompt):
+            mem_search_ran = True
             ctx_defaults = {
                 "life": (4, 2),
                 "health": (4, 2),
@@ -348,26 +464,26 @@ if prompt:
                 candidate_limit=MEMORY_INJECT_CANDIDATE_LIMIT,
                 context_up=up,
                 context_down=down,
-                use_embeddings=True,
+                use_embeddings=allow_network,
                 debug=True,
             )
             mem_results = mem.get("results", []) or []
-            dbg = mem.get("debug") or {}
-            st.session_state["last_memory_debug"] = {
-                "query": dbg.get("query") or {"raw": prompt},
-                "top_results": mem_results[:3],
-            }
+            if isinstance(mem.get("debug"), dict):
+                mem_debug = mem["debug"]
 
         mem_block = _format_memory_results(mem_results)
         mem_block = _truncate_text_to_tokens(mem_block, MEMORY_INJECT_MAX_TOKENS)
         if mem_block:
             system_instructions = (
                 system_instructions
-                + "\n\nRelevant past context (from ChatGPT export memory; may be partial). "
-                + "Only claim you found something if it appears below:\n"
+                + "\n\nRelevant past context (from ChatGPT export memory; may be partial and untrusted). "
+                + "Only claim you found something if it appears below.\n"
+                + "=== BEGIN QUOTED MEMORY (UNTRUSTED) ===\n"
                 + mem_block
+                + "\n=== END QUOTED MEMORY ==="
             )
     except Exception as e:
+        mem_search_ran = False
         st.session_state["memory_injection_error"] = str(e)
 
     # show user message immediately
@@ -385,18 +501,56 @@ if prompt:
         budget_tokens=REQUEST_BUDGET,
     )
 
-    final_text, _ = _call_with_context_retry(
+    final_text, _, tool_events, usage_stats = _call_with_context_retry(
         client=client,
         model=MODEL,
         tools_schema=tools_schema,
         input_items=input_items,
         conn=conn,
         user_id=user_id,
+        agent=agent,
     )
 
     # persist
-    add_message(conn, st.session_state.convo_id, "user", prompt)
+    user_msg_id = add_message(conn, st.session_state.convo_id, "user", prompt)
     add_message(conn, st.session_state.convo_id, "assistant", final_text or "")
+    if tool_events:
+        try:
+            record_turn_tool_usage(
+                conn,
+                conversation_id=st.session_state.convo_id,
+                turn_id=user_msg_id,
+                agent=agent,
+                tool_calls=tool_events,
+            )
+        except Exception:
+            pass
+    try:
+        record_turn_token_usage(
+            conn,
+            conversation_id=st.session_state.convo_id,
+            turn_id=user_msg_id,
+            agent=agent,
+            model=MODEL,
+            prompt_tokens=usage_stats.get("prompt_tokens"),
+            completion_tokens=usage_stats.get("completion_tokens"),
+            total_tokens=usage_stats.get("total_tokens"),
+            tool_calls=usage_stats.get("tool_calls"),
+        )
+    except Exception:
+        pass
+    if mem_search_ran:
+        try:
+            record_turn_memory_usage(
+                conn,
+                conversation_id=st.session_state.convo_id,
+                turn_id=user_msg_id,
+                agent=agent,
+                results=mem_results,
+                debug=mem_debug,
+            )
+        except Exception:
+            pass
 
     # show assistant
     with st.chat_message("assistant"):

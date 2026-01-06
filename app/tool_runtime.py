@@ -1,100 +1,118 @@
 # app/tool_runtime.py
 
 import json
+import time
+from pathlib import Path
 from typing import Any, Dict
+from urllib.parse import urlparse
 
 from . import tools as t
+from .tool_registry import get_tool_meta
+from .tools_permissions import get_tool_policy
 
 class ToolError(Exception):
     pass
 
-def call_tool(name: str, args: Dict[str, Any], *, conn, user_id: str) -> str:
+
+def _normalize_domain(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        return urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+
+
+def _path_within_roots(path: str, roots: list[str]) -> bool:
+    try:
+        p = Path(path).expanduser().resolve()
+    except Exception:
+        return False
+    for root in roots:
+        try:
+            r = Path(root).expanduser().resolve()
+        except Exception:
+            continue
+        try:
+            p.relative_to(r)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _enforce_constraints(name: str, args: Dict[str, Any], constraints: Dict[str, Any]) -> None:
+    if not constraints:
+        return
+
+    fs_roots = constraints.get("fs_roots") or constraints.get("fs_allowlist")
+    if isinstance(fs_roots, list) and fs_roots:
+        for key in ("path", "output_path", "dest_dir", "source_path", "cwd"):
+            raw = args.get(key)
+            if not raw or not isinstance(raw, str):
+                continue
+            if not _path_within_roots(raw, fs_roots):
+                raise ToolError(f"Permission denied: path '{raw}' is outside allowed roots.")
+
+    shell_allow = constraints.get("shell_allowlist") or constraints.get("shell_allow")
+    shell_deny = constraints.get("shell_denylist") or constraints.get("shell_deny")
+    cmd = args.get("command") if isinstance(args.get("command"), str) else ""
+    if cmd and (shell_allow or shell_deny):
+        first = cmd.strip().split()[0] if cmd.strip() else ""
+        if shell_allow and isinstance(shell_allow, list) and first and first not in shell_allow:
+            raise ToolError("Permission denied: shell command not in allowlist.")
+        if shell_deny and isinstance(shell_deny, list) and first in shell_deny:
+            raise ToolError("Permission denied: shell command is denied by policy.")
+
+    net_allow = constraints.get("network_allowlist") or constraints.get("network_allow")
+    net_deny = constraints.get("network_denylist") or constraints.get("network_deny")
+    if net_allow or net_deny:
+        url = ""
+        if isinstance(args.get("url"), str):
+            url = args["url"]
+        elif isinstance(args.get("repo_url"), str):
+            url = args["repo_url"]
+        domain = _normalize_domain(url) or ("duckduckgo.com" if name == "web_search" else "")
+        if net_allow and isinstance(net_allow, list) and domain and domain not in net_allow:
+            raise ToolError("Permission denied: network domain not in allowlist.")
+        if net_deny and isinstance(net_deny, list) and domain and domain in net_deny:
+            raise ToolError("Permission denied: network domain denied by policy.")
+
+def call_tool(name: str, args: Dict[str, Any], *, conn, user_id: str, agent: str | None = None) -> str:
     """
     Must return a STRING. JSON string is fine.
     The model will interpret it. :contentReference[oaicite:2]{index=2}
     """
     try:
+        start_time = time.perf_counter()
         perms = t.get_permissions(conn, user_id)
+        agent_val = (agent or "general").strip().lower()
 
-        WRITE_TOOLS = {
-            # life
-            "create_event",
-            "update_event",
-            "delete_event",
-            "create_task",
-            "complete_task",
-            "add_contact",
-            "create_doc",
-            "append_doc",
-            "draft_email",
-            "log_expense",
-            "send_email",
-            # health
-            "create_appointment",
-            "previsit_checklist",
-            "log_metric",
-            "med_schedule_add",
-            "log_meal",
-            "log_workout",
-            "import_health_data",
-            # ds
-            "write_table",
-            "upload_file",
-            "run_python",
-            "log_run",
-            # profile
-            "set_profile",
-            # filesystem / shell
-            "export_pdf",
-            "apply_patch",
-            "run_command",
-            "clone_repo",
-            # existing
-            "create_reminder",
-            "ds_create_course",
-            "ds_start_course",
-            "ds_next_lesson",
-            "ds_grade_submission",
-            "ds_record_progress",
-            "code_record_progress",
-        }
+        meta = get_tool_meta(name)
+        if not meta:
+            raise ToolError(f"Unknown tool: {name}")
 
-        NETWORK_TOOLS = {
-            "estimate_travel_time",
-            "send_email",
-            "search_email",
-            "fetch_url",
-            "web_search",
-            "clinical_guideline_search",
-            "clone_repo",
-        }
-
-        FS_WRITE_TOOLS = {
-            "export_pdf",
-            "upload_file",
-            "apply_patch",
-            "clone_repo",
-        }
-
-        SHELL_TOOLS = {
-            "search_code",
-            "run_command",
-            "apply_patch",
-            "clone_repo",
-        }
-
-        EXEC_TOOLS = {"run_python"}
-
-        if name in WRITE_TOOLS and perms.get("mode") != "write":
+        caps = set(meta.get("capabilities") or [])
+        if "write" in caps and perms.get("mode") != "write":
             raise ToolError("Permission denied: this tool requires permissions_set(mode='write').")
-        if name in NETWORK_TOOLS and not perms.get("allow_network"):
+        if "network" in caps and not perms.get("allow_network"):
             raise ToolError("Permission denied: this tool requires permissions_set(..., allow_network=true).")
-        if name in FS_WRITE_TOOLS and not perms.get("allow_fs_write"):
+        if "fs_write" in caps and not perms.get("allow_fs_write"):
             raise ToolError("Permission denied: this tool requires permissions_set(..., allow_fs_write=true).")
-        if name in SHELL_TOOLS and not perms.get("allow_shell"):
+        if "shell" in caps and not perms.get("allow_shell"):
             raise ToolError("Permission denied: this tool requires permissions_set(..., allow_shell=true).")
-        if name in EXEC_TOOLS and not perms.get("allow_exec"):
+        if "exec" in caps and not perms.get("allow_exec"):
             raise ToolError("Permission denied: this tool requires permissions_set(..., allow_exec=true).")
+        if name == "memory_search_graph" and args.get("use_embeddings", True) and not perms.get("allow_network"):
+            raise ToolError("Permission denied: embeddings require permissions_set(..., allow_network=true).")
+
+        policy = get_tool_policy(conn, user_id=user_id, agent=agent_val, tool_name=name)
+        if policy:
+            if not policy.get("allow", True):
+                raise ToolError("Permission denied: tool disabled by policy.")
+            constraints = policy.get("constraints") or {}
+            if isinstance(constraints, dict) and constraints:
+                _enforce_constraints(name, args, constraints)
 
         out: Any = None
 
@@ -109,6 +127,22 @@ def call_tool(name: str, args: Dict[str, Any], *, conn, user_id: str) -> str:
                 allow_fs_write=args.get("allow_fs_write"),
                 allow_shell=args.get("allow_shell"),
                 allow_exec=args.get("allow_exec"),
+            )
+        elif name == "tool_policy_set":
+            out = t.tool_policy_set(
+                conn,
+                user_id=user_id,
+                agent=args["agent"],
+                tool_name=args["tool_name"],
+                allow=bool(args["allow"]),
+                constraints=args.get("constraints"),
+            )
+        elif name == "tool_policy_list":
+            out = t.tool_policy_list(
+                conn,
+                user_id=user_id,
+                agent=args.get("agent"),
+                limit=int(args.get("limit", 200)),
             )
         elif name == "log_action":
             out = t.log_action(
@@ -449,8 +483,17 @@ def call_tool(name: str, args: Dict[str, Any], *, conn, user_id: str) -> str:
         elif out is None:
             raise ToolError(f"Unknown tool: {name}")
 
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
         try:
-            t.audit_log_append(conn, user_id=user_id, tool=name, payload=args, result=out, status="ok")
+            t.audit_log_append(
+                conn,
+                user_id=user_id,
+                tool=name,
+                payload=args,
+                result=out,
+                status="ok",
+                duration_ms=duration_ms,
+            )
         except Exception:
             pass
         return json.dumps(out, ensure_ascii=False)
@@ -459,7 +502,17 @@ def call_tool(name: str, args: Dict[str, Any], *, conn, user_id: str) -> str:
         # Return an error string; the model can recover.
         err = str(e)
         try:
-            t.audit_log_append(conn, user_id=user_id, tool=name, payload=args, result={"error": err}, status="error", error=err)
+            duration_ms = int((time.perf_counter() - start_time) * 1000)
+            t.audit_log_append(
+                conn,
+                user_id=user_id,
+                tool=name,
+                payload=args,
+                result={"error": err},
+                status="error",
+                error=err,
+                duration_ms=duration_ms,
+            )
         except Exception:
             pass
         return json.dumps({"error": err, "tool": name}, ensure_ascii=False)

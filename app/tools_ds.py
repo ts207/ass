@@ -292,7 +292,7 @@ def ds_next_lesson(conn, user_id: str, course_id: str) -> Dict[str, Any]:
 
 def ds_grade_submission(conn, user_id: str, course_id: str, lesson_key: str, submission: str) -> Dict[str, Any]:
     course = _get_course(conn, user_id, course_id)
-    lessons = {l["key"]: l for l in course.get("lessons", [])}
+    lessons = {lesson_item["key"]: lesson_item for lesson_item in course.get("lessons", [])}
     lesson = lessons.get(lesson_key)
     if not lesson:
         raise ValueError("Lesson not found in course.")

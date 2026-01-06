@@ -98,6 +98,40 @@ permissions_set = {
     },
 }
 
+tool_policy_set = {
+    "type": "function",
+    "name": "tool_policy_set",
+    "description": "Set allow/deny policy for a specific tool and agent scope, with optional constraints.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "agent": {"type": "string", "enum": ["life", "health", "ds", "code", "general", "any"]},
+            "tool_name": {"type": "string"},
+            "allow": {"type": "boolean"},
+            "constraints": {
+                "type": "object",
+                "description": "Optional constraints (fs_roots, shell_allowlist, network_allowlist).",
+                "additionalProperties": True,
+            },
+        },
+        "required": ["agent", "tool_name", "allow"],
+    },
+}
+
+tool_policy_list = {
+    "type": "function",
+    "name": "tool_policy_list",
+    "description": "List tool policies for the user (optionally filtered by agent).",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "agent": {"type": "string", "enum": ["life", "health", "ds", "code", "general", "any"]},
+            "limit": {"type": "integer", "default": 200, "minimum": 1, "maximum": 500},
+        },
+        "required": [],
+    },
+}
+
 log_action = {
     "type": "function",
     "name": "log_action",
@@ -1034,6 +1068,8 @@ CODE_TOOLS = [
 GENERAL_TOOLS = [
     permissions_get,
     permissions_set,
+    tool_policy_set,
+    tool_policy_list,
     audit_log_list,
     log_action,
     delegate_agent,

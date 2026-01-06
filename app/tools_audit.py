@@ -13,13 +13,15 @@ def audit_log_append(
     result: Any = None,
     status: str = "ok",
     error: str | None = None,
+    duration_ms: int | None = None,
 ) -> str:
     aid = _id("audit")
     now = _now_iso()
     payload_json = json.dumps(payload, ensure_ascii=False) if payload is not None else None
     result_json = json.dumps(result, ensure_ascii=False) if result is not None else None
     conn.execute(
-        "INSERT INTO audit_log (id,user_id,tool,payload_json,result_json,status,error,created_at) VALUES (?,?,?,?,?,?,?,?)",
+        "INSERT INTO audit_log (id,user_id,tool,payload_json,result_json,status,error,duration_ms,created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
         (
             aid,
             user_id,
@@ -28,6 +30,7 @@ def audit_log_append(
             _truncate_json_str(result_json) if result_json else None,
             status,
             error,
+            duration_ms,
             now,
         ),
     )
@@ -52,12 +55,14 @@ def audit_log_list(conn, user_id: str, limit: int = 20, tool: str | None = None)
     limit_val = max(1, min(int(limit or 20), 200))
     if tool:
         rows = conn.execute(
-            "SELECT id, tool, status, error, created_at FROM audit_log WHERE user_id=? AND tool=? ORDER BY created_at DESC LIMIT ?",
+            "SELECT id, tool, status, error, duration_ms, created_at "
+            "FROM audit_log WHERE user_id=? AND tool=? ORDER BY created_at DESC LIMIT ?",
             (user_id, tool, limit_val),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT id, tool, status, error, created_at FROM audit_log WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+            "SELECT id, tool, status, error, duration_ms, created_at "
+            "FROM audit_log WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
             (user_id, limit_val),
         ).fetchall()
     return {"entries": [dict(r) for r in rows]}

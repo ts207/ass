@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import re
 
+from app.tools_core import _truncate_json_str
+
 def _fts_query(user_query: str, *, mode: str = "auto") -> str:
     """
     Make a safer FTS5 MATCH query from free text.
@@ -190,13 +192,18 @@ def chatgpt_context_window(
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def connect(db_path: str, *, check_same_thread: bool = False, timeout: float = 30.0) -> sqlite3.Connection:
+def connect(db_path: str | Path, *, check_same_thread: bool = False, timeout: float = 30.0) -> sqlite3.Connection:
     conn = sqlite3.connect(
-        db_path,
+        str(db_path),
         check_same_thread=check_same_thread,
         timeout=timeout,
     )
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
     return conn
 
 
@@ -246,6 +253,289 @@ def get_recent_messages(conn: sqlite3.Connection, convo_id: str, max_messages: i
     # DB query returns newest-first; reverse for chronological order
     rows = list(reversed(rows))
     return [{"role": r["role"], "content": r["content"]} for r in rows]
+
+def get_last_user_message_id(conn: sqlite3.Connection, convo_id: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT id FROM messages WHERE conversation_id=? AND role='user' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (convo_id,),
+    ).fetchone()
+    return row["id"] if row else None
+
+def _truncate_snippet(text: str, max_chars: int = 2000) -> str:
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "..."
+
+def record_turn_memory_usage(
+    conn: sqlite3.Connection,
+    *,
+    conversation_id: str,
+    turn_id: str,
+    agent: str,
+    results: Optional[List[Dict[str, Any]]] = None,
+    debug: Optional[Dict[str, Any]] = None,
+) -> None:
+    now = _now_iso()
+    results = results or []
+
+    score_map: Dict[str, Any] = {}
+    if isinstance(debug, dict):
+        for row in debug.get("top_scores") or []:
+            node_id = row.get("node_id")
+            if node_id:
+                score_map[node_id] = row.get("score")
+
+    meta_base: Dict[str, Any] = {}
+    if isinstance(debug, dict):
+        qinfo = debug.get("query")
+        if qinfo:
+            meta_base["query"] = qinfo
+        if "candidates" in debug:
+            meta_base["candidates"] = debug.get("candidates")
+        if "used_embeddings" in debug:
+            meta_base["used_embeddings"] = debug.get("used_embeddings")
+        if "mmr_used" in debug:
+            meta_base["mmr_used"] = debug.get("mmr_used")
+        if "mmr_lambda" in debug:
+            meta_base["mmr_lambda"] = debug.get("mmr_lambda")
+        if "mmr_pool" in debug:
+            meta_base["mmr_pool"] = debug.get("mmr_pool")
+        if debug.get("fts_query"):
+            meta_base["fts_query"] = debug.get("fts_query")
+        if debug.get("fts_mode"):
+            meta_base["fts_mode"] = debug.get("fts_mode")
+        if debug.get("agent_tag"):
+            meta_base["agent_tag"] = debug.get("agent_tag")
+
+    def _meta_json(title: Optional[str] = None) -> Optional[str]:
+        if not meta_base and not title:
+            return None
+        meta = dict(meta_base)
+        if title:
+            meta["title"] = title
+        return json.dumps(meta, ensure_ascii=False)
+
+    conn.execute(
+        "DELETE FROM turn_memory_usage WHERE conversation_id=? AND turn_id=?",
+        (conversation_id, turn_id),
+    )
+
+    if not results:
+        conn.execute(
+            "INSERT INTO turn_memory_usage "
+            "(id, conversation_id, turn_id, agent, node_id, rank, score, snippet, meta_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                f"tmu_{uuid.uuid4().hex}",
+                conversation_id,
+                turn_id,
+                agent,
+                None,
+                0,
+                None,
+                None,
+                _meta_json(),
+                now,
+            ),
+        )
+        conn.commit()
+        return
+
+    for idx, r in enumerate(results, start=1):
+        node_id = r.get("node_id")
+        title = (r.get("title") or "").strip() or None
+        snippet = _truncate_snippet(r.get("context") or "")
+        score = score_map.get(node_id)
+        conn.execute(
+            "INSERT INTO turn_memory_usage "
+            "(id, conversation_id, turn_id, agent, node_id, rank, score, snippet, meta_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                f"tmu_{uuid.uuid4().hex}",
+                conversation_id,
+                turn_id,
+                agent,
+                node_id,
+                idx,
+                score,
+                snippet,
+                _meta_json(title),
+                now,
+            ),
+        )
+    conn.commit()
+
+def get_turn_memory_usage(
+    conn: sqlite3.Connection,
+    conversation_id: str,
+    turn_id: str,
+) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT node_id, rank, score, snippet, meta_json "
+        "FROM turn_memory_usage WHERE conversation_id=? AND turn_id=? "
+        "ORDER BY rank ASC",
+        (conversation_id, turn_id),
+    ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        meta: Dict[str, Any] = {}
+        raw = r["meta_json"] if hasattr(r, "keys") else r[4]
+        if raw:
+            try:
+                meta = json.loads(raw)
+            except Exception:
+                meta = {}
+        out.append(
+            {
+                "node_id": r["node_id"] if hasattr(r, "keys") else r[0],
+                "rank": r["rank"] if hasattr(r, "keys") else r[1],
+                "score": r["score"] if hasattr(r, "keys") else r[2],
+                "snippet": r["snippet"] if hasattr(r, "keys") else r[3],
+                "meta": meta,
+            }
+        )
+    return out
+
+
+def record_turn_tool_usage(
+    conn: sqlite3.Connection,
+    *,
+    conversation_id: str,
+    turn_id: str,
+    agent: str,
+    tool_calls: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    now = _now_iso()
+    tool_calls = tool_calls or []
+    conn.execute(
+        "DELETE FROM turn_tool_usage WHERE conversation_id=? AND turn_id=?",
+        (conversation_id, turn_id),
+    )
+    if not tool_calls:
+        conn.commit()
+        return
+
+    for call in tool_calls:
+        tool_name = call.get("tool_name") or call.get("name")
+        status = call.get("status") or "ok"
+        error = call.get("error")
+        duration_ms = call.get("duration_ms")
+        input_obj = call.get("input")
+        output_obj = call.get("output")
+        input_json = json.dumps(input_obj, ensure_ascii=False) if input_obj is not None else None
+        output_json = json.dumps(output_obj, ensure_ascii=False) if output_obj is not None else None
+        conn.execute(
+            "INSERT INTO turn_tool_usage "
+            "(id, conversation_id, turn_id, agent, tool_name, input_json, output_json, status, error, duration_ms, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                f"ttu_{uuid.uuid4().hex}",
+                conversation_id,
+                turn_id,
+                agent,
+                tool_name,
+                _truncate_json_str(input_json) if input_json else None,
+                _truncate_json_str(output_json) if output_json else None,
+                status,
+                error,
+                int(duration_ms) if duration_ms is not None else None,
+                now,
+            ),
+        )
+    conn.commit()
+
+
+def get_turn_tool_usage(
+    conn: sqlite3.Connection,
+    conversation_id: str,
+    turn_id: str,
+) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT tool_name, status, error, duration_ms, input_json, output_json "
+        "FROM turn_tool_usage WHERE conversation_id=? AND turn_id=? "
+        "ORDER BY created_at ASC",
+        (conversation_id, turn_id),
+    ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        def _load(raw):
+            if not raw:
+                return None
+            try:
+                return json.loads(raw)
+            except Exception:
+                return raw
+        out.append(
+            {
+                "tool_name": r["tool_name"] if hasattr(r, "keys") else r[0],
+                "status": r["status"] if hasattr(r, "keys") else r[1],
+                "error": r["error"] if hasattr(r, "keys") else r[2],
+                "duration_ms": r["duration_ms"] if hasattr(r, "keys") else r[3],
+                "input": _load(r["input_json"] if hasattr(r, "keys") else r[4]),
+                "output": _load(r["output_json"] if hasattr(r, "keys") else r[5]),
+            }
+        )
+    return out
+
+
+def record_turn_token_usage(
+    conn: sqlite3.Connection,
+    *,
+    conversation_id: str,
+    turn_id: str,
+    agent: str,
+    model: str,
+    prompt_tokens: Optional[int],
+    completion_tokens: Optional[int],
+    total_tokens: Optional[int],
+    tool_calls: Optional[int],
+) -> None:
+    now = _now_iso()
+    conn.execute(
+        "DELETE FROM turn_token_usage WHERE conversation_id=? AND turn_id=?",
+        (conversation_id, turn_id),
+    )
+    conn.execute(
+        "INSERT INTO turn_token_usage "
+        "(id, conversation_id, turn_id, agent, model, prompt_tokens, completion_tokens, total_tokens, tool_calls, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            f"ttok_{uuid.uuid4().hex}",
+            conversation_id,
+            turn_id,
+            agent,
+            model,
+            int(prompt_tokens) if prompt_tokens is not None else None,
+            int(completion_tokens) if completion_tokens is not None else None,
+            int(total_tokens) if total_tokens is not None else None,
+            int(tool_calls) if tool_calls is not None else None,
+            now,
+        ),
+    )
+    conn.commit()
+
+
+def get_turn_token_usage(
+    conn: sqlite3.Connection,
+    conversation_id: str,
+    turn_id: str,
+) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        "SELECT model, prompt_tokens, completion_tokens, total_tokens, tool_calls "
+        "FROM turn_token_usage WHERE conversation_id=? AND turn_id=?",
+        (conversation_id, turn_id),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "model": row["model"],
+        "prompt_tokens": row["prompt_tokens"],
+        "completion_tokens": row["completion_tokens"],
+        "total_tokens": row["total_tokens"],
+        "tool_calls": row["tool_calls"],
+    }
 def get_latest_conversation_id(conn, user_id: str) -> str | None:
     row = conn.execute(
         "SELECT id FROM conversations WHERE user_id=? ORDER BY updated_at DESC LIMIT 1",
@@ -581,6 +871,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         "result_json TEXT, "
         "status TEXT NOT NULL, "
         "error TEXT, "
+        "duration_ms INTEGER, "
         "created_at TEXT NOT NULL)"
     )
     conn.execute(
@@ -590,6 +881,91 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_audit_tool_time "
         "ON audit_log(tool, created_at)"
+    )
+
+    if _has_column(conn, "audit_log", "id") and not _has_column(conn, "audit_log", "duration_ms"):
+        conn.execute("ALTER TABLE audit_log ADD COLUMN duration_ms INTEGER")
+
+    # Turn memory usage (for last-turn UI/debug)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS turn_memory_usage ("
+        "id TEXT PRIMARY KEY, "
+        "conversation_id TEXT NOT NULL, "
+        "turn_id TEXT NOT NULL, "
+        "agent TEXT NOT NULL, "
+        "node_id TEXT, "
+        "rank INTEGER, "
+        "score REAL, "
+        "snippet TEXT, "
+        "meta_json TEXT, "
+        "created_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_turn_memory_usage_convo_time "
+        "ON turn_memory_usage(conversation_id, created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_turn_memory_usage_turn "
+        "ON turn_memory_usage(conversation_id, turn_id)"
+    )
+
+    # Turn tool usage (for last-turn UI/debug)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS turn_tool_usage ("
+        "id TEXT PRIMARY KEY, "
+        "conversation_id TEXT NOT NULL, "
+        "turn_id TEXT NOT NULL, "
+        "agent TEXT NOT NULL, "
+        "tool_name TEXT, "
+        "input_json TEXT, "
+        "output_json TEXT, "
+        "status TEXT NOT NULL, "
+        "error TEXT, "
+        "duration_ms INTEGER, "
+        "created_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_turn_tool_usage_convo_time "
+        "ON turn_tool_usage(conversation_id, created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_turn_tool_usage_turn "
+        "ON turn_tool_usage(conversation_id, turn_id)"
+    )
+
+    # Turn token usage (for last-turn UI/debug)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS turn_token_usage ("
+        "id TEXT PRIMARY KEY, "
+        "conversation_id TEXT NOT NULL, "
+        "turn_id TEXT NOT NULL, "
+        "agent TEXT NOT NULL, "
+        "model TEXT NOT NULL, "
+        "prompt_tokens INTEGER, "
+        "completion_tokens INTEGER, "
+        "total_tokens INTEGER, "
+        "tool_calls INTEGER, "
+        "created_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_turn_token_usage_turn "
+        "ON turn_token_usage(conversation_id, turn_id)"
+    )
+
+    # Tool policies (scoped permissions)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS tool_policies ("
+        "user_id TEXT NOT NULL, "
+        "agent TEXT NOT NULL, "
+        "tool_name TEXT NOT NULL, "
+        "allow INTEGER NOT NULL, "
+        "constraints_json TEXT, "
+        "updated_at TEXT NOT NULL, "
+        "PRIMARY KEY (user_id, agent, tool_name))"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tool_policies_user_agent "
+        "ON tool_policies(user_id, agent)"
     )
 
     # Backfill due_at_utc where missing

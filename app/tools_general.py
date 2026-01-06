@@ -17,6 +17,8 @@ from app.db import (
     get_recent_messages,
     get_user_profile,
     set_agent_conversation_id,
+    record_turn_tool_usage,
+    record_turn_token_usage,
 )
 
 
@@ -203,33 +205,62 @@ def delegate_agent(
     client = _get_openai_client()
     tools_schema = _agent_tools_schema(agent_val)
 
+    tool_events = []
+    usage_stats = {}
     try:
-        final_text, _ = run_with_tools(
+        final_text, _, tool_events, usage_stats = run_with_tools(
             client=client,
             model=MODEL,
             tools_schema=tools_schema,
             input_items=input_items,
             conn=conn,
             user_id=user_id,
+            agent=agent_val,
             debug=False,
             call_tool_fn=call_tool_fn,
         )
     except Exception as e:
         if "context_length_exceeded" in str(e) and history_msgs:
-            final_text, _ = run_with_tools(
+            final_text, _, tool_events, usage_stats = run_with_tools(
                 client=client,
                 model=MODEL,
                 tools_schema=tools_schema,
                 input_items=[{"role": "system", "content": system_instructions}, {"role": "user", "content": text}],
                 conn=conn,
                 user_id=user_id,
+                agent=agent_val,
                 debug=False,
                 call_tool_fn=call_tool_fn,
             )
         else:
             raise
 
-    add_message(conn, agent_convo, "user", f"{agent_val}: {text}")
+    user_msg_id = add_message(conn, agent_convo, "user", f"{agent_val}: {text}")
     add_message(conn, agent_convo, "assistant", final_text or "")
+    if tool_events:
+        try:
+            record_turn_tool_usage(
+                conn,
+                conversation_id=agent_convo,
+                turn_id=user_msg_id,
+                agent=agent_val,
+                tool_calls=tool_events,
+            )
+        except Exception:
+            pass
+    try:
+        record_turn_token_usage(
+            conn,
+            conversation_id=agent_convo,
+            turn_id=user_msg_id,
+            agent=agent_val,
+            model=MODEL,
+            prompt_tokens=usage_stats.get("prompt_tokens"),
+            completion_tokens=usage_stats.get("completion_tokens"),
+            total_tokens=usage_stats.get("total_tokens"),
+            tool_calls=usage_stats.get("tool_calls"),
+        )
+    except Exception:
+        pass
 
     return {"agent": agent_val, "task": text, "response": final_text, "conversation_id": agent_convo}

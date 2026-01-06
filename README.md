@@ -1,6 +1,7 @@
 # ass — Local‑First Assistant (Life + DS) with SQLite + Tools
 
 Local-first assistant with:
+
 - SQLite-backed conversations + reminders + DS progress
 - OpenAI Responses API tool-calling loop
 - Optional long-term memory from your ChatGPT export (graph + FTS + embeddings rerank)
@@ -11,7 +12,7 @@ Local-first assistant with:
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -U pip
-python -m pip install openai python-dotenv numpy streamlit
+python -m pip install -r requirements.txt
 
 cat > .env <<'EOF'
 OPENAI_API_KEY=sk-REPLACE_ME
@@ -29,22 +30,29 @@ streamlit run ui_streamlit.py
 ## Deploy/Run Options
 
 ### systemd (CLI daemon)
+
 1) Edit `systemd/ass.service` (set `USER`, paths, `OPENAI_API_KEY`, and any SMTP/IMAP envs).
 2) Install + start:
+
    ```bash
    sudo cp systemd/ass.service /etc/systemd/system/ass.service
    sudo systemctl daemon-reload
    sudo systemctl enable --now ass.service
    ```
+
 3) Logs: `journalctl -u ass.service -f`
 
 ### Docker
+
 Build and run the Streamlit UI:
+
 ```bash
 docker build -t ass .
 docker run --rm -p 8501:8501 -e OPENAI_API_KEY=sk-REPLACE ass
 ```
+
 For CLI inside container:
+
 ```bash
 docker run --rm -it -e OPENAI_API_KEY=sk-REPLACE ass python -m app.chat
 ```
@@ -52,18 +60,23 @@ docker run --rm -it -e OPENAI_API_KEY=sk-REPLACE ass python -m app.chat
 Mount `data/` as a volume if you want persistence outside the container.
 
 ### Telegram Bot (chat + reminders to your phone)
+
 1) Create a bot via @BotFather and grab the token; find your user id (e.g. via @userinfobot).
 2) Add to `.env`:
-   ```
+
+   ```env
    TELEGRAM_BOT_TOKEN=123:abc
    TELEGRAM_ALLOWED_USER_IDS=12345678             # optional, comma-separated allowlist
    TELEGRAM_DEFAULT_CHAT_ID=12345678              # where reminders go if the bot has not seen a chat yet
    ```
-3) Install deps (`pip install -r requirements.txt`) then run: `python -m app.telegram_bot`
-4) In Telegram, DM the bot `/start` then chat normally (e.g., `general: plan my week`, `life: remind me at 8am to take meds`).
-5) Keep the bot process running (systemd or tmux) so reminders can be pushed to Telegram; it uses long polling (no public webhook needed).
+
+3) Install deps (`pip install -r requirements.txt`). If you want reminders to run in Telegram, add the job queue extra: `pip install "python-telegram-bot[job-queue]"`.
+4) Run: `python -m app.telegram_bot`
+5) In Telegram, DM the bot `/start` then chat normally (e.g., `general: plan my week`, `life: remind me at 8am to take meds`).
+6) Keep the bot process running (systemd or tmux) so reminders can be pushed to Telegram; it uses long polling (no public webhook needed).
 
 ## First-Time Setup Checklist
+
 - [ ] Create and activate venv: `python3 -m venv .venv && source .venv/bin/activate`
 - [ ] Install deps: `pip install -U pip && pip install -r requirements.txt`
 - [ ] Add `.env` with `OPENAI_API_KEY=...` (and SMTP/IMAP if using email)
@@ -71,7 +84,9 @@ Mount `data/` as a volume if you want persistence outside the container.
 - [ ] Set your profile timezone: `general: save my timezone as <IANA>` in CLI/Streamlit
 - [ ] Decide permissions: enable only what you need (`/perm net on|off`, `/perm fs on|off`, `/perm shell on|off`, `/perm exec on|off`)
 - [ ] Optional: enable systemd service (`systemd/ass.service`) or run Streamlit (`streamlit run ui_streamlit.py`)
+
 ## How It Works (Architecture)
+
 - `app/chat.py`: CLI entrypoint; keeps a per-agent conversation thread; reminder watcher.
 - `ui_streamlit.py`: Web UI; sidebar controls for agent + permissions.
 - `app/tools_*.py`: Tool implementations split by domain; `app/tools.py` re-exports for the model.
@@ -81,6 +96,7 @@ Mount `data/` as a volume if you want persistence outside the container.
 - Memory: Imported ChatGPT export (FTS + optional embeddings) + user profile memory injected into prompts.
 
 ## Starter Commands (CLI)
+
 - Reminders/Tasks: `life: remind me tomorrow at 9am to take meds`; `life: create a task to file taxes due next Friday`
 - Calendar: `life: list events between 2026-01-10 and 2026-01-20`
 - Health: `health: log_metric {"metric":"sleep_hours","value":7.5}`; `health: add a med schedule for atenolol 50mg at 08:00 and 20:00`
@@ -89,6 +105,7 @@ Mount `data/` as a volume if you want persistence outside the container.
 - Code (needs `/perm shell on` + `/perm fs on`): `code: search_code {"query":"TODO","path":"app"}`
 
 ## Operations
+
 - Logs: `journalctl -u ass.service -f` (systemd) or container logs; CLI prints reminders to stdout.
 - DB backup: copy `data/assistant.sqlite3`; keep `.env` out of git.
 - Permissions: use `/perm` (CLI) or Streamlit sidebar; keep shell/fs/exec off unless needed.
@@ -110,16 +127,18 @@ general: web_search latest NICE guideline on hypertension
 
 The `general` agent is the coordinator and can delegate tasks to the other agents when appropriate.
 
-Streamlit shows a collapsible “Memory used” panel (sidebar) for the last turn.
+Streamlit shows collapsible “Memory used” and “Memory debug (last turn)” panels in the sidebar.
 
 ## Run It (Step-by-Step)
+
 1) Activate your venv and env vars: `source .venv/bin/activate && export $(cat .env | xargs)`.
 2) Start the CLI: `python -m app.chat` (keeps reminder watcher alive). For UI: `streamlit run ui_streamlit.py`.
 3) Set safety rails: `/perm` then toggle net/fs/shell/exec as needed.
-4) Talk to agents: prefix with `general:` (delegates), `life:`, `health:`, `ds:`, `code:`.
+4) Talk to agents: prefix with `general:` (delegates), `life:`, `health:`, `ds:`, `code:`. In the CLI, unprefixed text routes to the life agent by default; in Telegram, unprefixed text routes to general; Streamlit uses the selected agent.
 5) Background use: keep the CLI running or install `systemd/ass.service` so reminders fire while logged out. For email/SMS pushes, set SMTP/IMAP envs and have the agent send reminders via those channels.
 
 ## What This Project Is
+
 - **Agents**: life (tasks/reminders/calendar/contacts/docs/expenses), health (metrics/meds/appointments/meals/workouts), ds (courses/SQL/runs), code (dev helper), general (coordinator + web/kb).
 - **Storage**: Single SQLite DB (`data/assistant.sqlite3`) for conversations, reminders, tasks, contacts, docs, expenses, health logs, DS runs, user profile, permissions, audit log, and imported ChatGPT memory.
 - **Safety**: Permission gates (`mode`, `allow_network`, `allow_fs_write`, `allow_shell`, `allow_exec`) + audit log.
@@ -128,6 +147,7 @@ Streamlit shows a collapsible “Memory used” panel (sidebar) for the last tur
 ## Permissions (Safety Controls)
 
 Tools are gated by a simple permissions model:
+
 - `mode`: `read` or `write`
 - capability flags: `allow_network`, `allow_fs_write`, `allow_shell`, `allow_exec`
 
@@ -140,6 +160,12 @@ CLI quick controls:
 /perm fs on|off      # allow filesystem writes (export_pdf, apply_patch)
 /perm shell on|off   # allow shell tools (search_code, run_command, git)
 /perm exec on|off    # allow code execution tools (run_python)
+```
+
+## Tests
+
+```bash
+python -m unittest discover tests
 ```
 
 ## ChatGPT Export Memory (Graph + Hybrid Search)
@@ -174,6 +200,36 @@ Eval harness (iterate on retrieval quality):
 python scripts/eval_memory.py --queries queries.txt --debug
 ```
 
+## Sessionization Analytics
+
+Generate session + conversation aggregates from `data/messages_clean.parquet`:
+
+```bash
+.venv/bin/python data/sessionization.py
+```
+
+Outputs (gap-specific unless noted):
+- `data/conversation_stats.parquet` (conversation metrics; `conversation_*` columns)
+- `data/sessions_gap15m.parquet`, `data/sessions_gap30m.parquet`, `data/sessions_gap60m.parquet`
+- `data/sessionization_summary_gap15m.json`, `data/sessionization_summary_gap30m.json`, `data/sessionization_summary_gap60m.json`
+- `data/session_kpis_gap15m.csv`, `data/session_kpis_gap30m.csv`, `data/session_kpis_gap60m.csv`
+- `data/session_gap_comparison.csv` + `data/plot_session_gap_comparison.png`
+- Outliers: `data/outliers_conversations_wallclock_top50.csv`, `data/outliers_sessions_wallclock_gap{gap}m_top50.csv`, `data/outliers_sessions_active_gap{gap}m_top50.csv`
+- Quality checks: `data/quality_checks_gap{gap}m.json` + non-monotonic CSVs if present
+- Manifests: `data/manifest_gap{gap}m.json`
+
+Definitions:
+- `conversation_wallclock_span_min` = `conversation_end - conversation_start`
+- `session_wallclock_span_min` = `session_end - session_start`
+- Session gap threshold: 15/30/60 minutes (set in `SESSION_GAPS_MIN`)
+- Active duration caps each inter-message gap by `ACTIVE_GAP_CAP_MIN` minutes
+
+Key results (gap 30m from current data):
+- p99 session wall-clock span: 87.74 minutes
+- p99 session active duration: 61.10 minutes
+- p99 conversation wall-clock span: 7961.11 minutes (~132.7 hours)
+- p99 sessions per conversation: 5
+
 ## Profile Memory (Stable Facts)
 
 The assistant can store stable facts/preferences/goals in `user_profiles` and inject them into the system prompt every turn.
@@ -187,6 +243,7 @@ life: save my timezone as Asia/Ulaanbaatar
 ## Tuning
 
 Edit `app/config.py`:
+
 - `MODEL` / `MODEL_CONTEXT_TOKENS`
 - `REQUEST_BUDGET_FRACTION` (70% by default; lower if you see context errors)
 - `MEMORY_INJECT_K`, `MEMORY_INJECT_CANDIDATE_LIMIT`, `MEMORY_INJECT_MAX_TOKENS`
@@ -200,9 +257,11 @@ If `tiktoken` is installed, token budgets are more accurate; otherwise the app f
 ## Repo Hygiene
 
 Keep exports and secrets out of git:
+
 - `.env`, `data/assistant.sqlite3`, `data/import/`, `conversations.json`, `chat.html`, `*.zip` are ignored by `.gitignore`.
 
 ## Outlook / Recommended Updates
+
 - Add connectors: Google/Outlook Calendar + IMAP/SMTP + mobile push to deliver reminders off-device.
 - Reliability: background scheduler (APScheduler or systemd timer) to re-check reminders and missed jobs.
 - Safety: per-tool allowlists, rate limits, and clearer consent prompts for shell/fs/exec tools.

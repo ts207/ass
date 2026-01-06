@@ -1,6 +1,13 @@
 """Thin re-export layer for tool functions split across modules."""
 
-from app.tools_permissions import DEFAULT_PERMISSIONS, get_permissions, permissions_get, permissions_set
+from app.tools_permissions import (
+    DEFAULT_PERMISSIONS,
+    get_permissions,
+    permissions_get,
+    permissions_set,
+    tool_policy_list,
+    tool_policy_set,
+)
 from app.tools_audit import audit_log_append, log_action, audit_log_list
 from app.tools_life import (
     add_contact,
@@ -75,6 +82,8 @@ __all__ = [
     "get_permissions",
     "permissions_get",
     "permissions_set",
+    "tool_policy_set",
+    "tool_policy_list",
     "audit_log_append",
     "log_action",
     "audit_log_list",

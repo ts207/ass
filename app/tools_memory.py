@@ -7,7 +7,12 @@ from typing import Any, Dict, List
 import numpy as np
 from openai import OpenAI
 
-from app.config import EMBEDDING_MODEL
+from app.config import (
+    EMBEDDING_MODEL,
+    MEMORY_MMR_CANDIDATE_POOL,
+    MEMORY_MMR_LAMBDA,
+    MEMORY_RECENCY_HALF_LIFE_DAYS,
+)
 from app.db import (
     chatgpt_context_window,
     chatgpt_fts_candidates,
@@ -76,7 +81,7 @@ def _rewrite_retrieval_query(query: str, *, max_terms: int = 6) -> Dict[str, Any
     return {"raw": raw, "cleaned": cleaned, "keywords": kept}
 
 
-def _recency_boost(create_time: int, *, half_life_days: float = 180.0) -> float:
+def _recency_boost(create_time: int, *, half_life_days: float = MEMORY_RECENCY_HALF_LIFE_DAYS) -> float:
     if not create_time or create_time <= 0:
         return 0.0
     age_days = max(0.0, (time.time() - float(create_time)) / 86400.0)
@@ -132,6 +137,7 @@ def memory_search_graph_tool(
 
     reranked = cands
     debug_scores: list[Dict[str, Any]] = []
+    score_map: Dict[str, float] = {}
     try:
         query_vec = _embed_query(query) if use_embeddings else None
         emb_map = chatgpt_get_embeddings(conn, [c["node_id"] for c in cands]) if use_embeddings else {}
@@ -159,6 +165,7 @@ def memory_search_graph_tool(
 
             if has_emb:
                 score = 0.65 * cos + 0.25 * fts_s + 0.10 * rec_s
+                score_map[c["node_id"]] = score
                 scored_with_emb.append(
                     (
                         score,
@@ -175,6 +182,7 @@ def memory_search_graph_tool(
                 )
             else:
                 score = 0.25 * fts_s + 0.10 * rec_s
+                score_map[c["node_id"]] = score
                 scored_no_emb.append(
                     (
                         score,
@@ -221,13 +229,73 @@ def memory_search_graph_tool(
                 ]
     except Exception:
         reranked = cands
+        score_map = {}
+
+    def _apply_mmr(
+        candidates: List[Dict[str, Any]],
+        *,
+        base_scores: Dict[str, float],
+        emb_map: Dict[str, Any],
+        k: int,
+        mmr_lambda: float,
+        pool_size: int,
+    ) -> List[Dict[str, Any]]:
+        if not candidates or k <= 0:
+            return []
+        lam = max(0.0, min(float(mmr_lambda), 1.0))
+        if lam <= 0.0 or lam >= 1.0:
+            return candidates[:k]
+        pool = candidates[: max(k, pool_size)] if pool_size > 0 else candidates
+        selected: List[Dict[str, Any]] = []
+        selected_embs: List[np.ndarray] = []
+        remaining = list(pool)
+        while remaining and len(selected) < k:
+            best_idx = None
+            best_score = None
+            for idx, cand in enumerate(remaining):
+                nid = cand["node_id"]
+                base = float(base_scores.get(nid, 0.0))
+                emb = emb_map.get(nid)
+                max_sim = 0.0
+                if emb is not None and selected_embs:
+                    max_sim = max(_cosine_similarity(emb, s) for s in selected_embs if s is not None)
+                mmr_score = lam * base - (1.0 - lam) * max_sim
+                if best_score is None or mmr_score > best_score:
+                    best_score = mmr_score
+                    best_idx = idx
+            if best_idx is None:
+                break
+            picked = remaining.pop(best_idx)
+            selected.append(picked)
+            picked_emb = emb_map.get(picked["node_id"])
+            if picked_emb is not None:
+                selected_embs.append(picked_emb)
+        return selected
+
+    mmr_used = False
+    if use_embeddings and score_map and emb_map and MEMORY_MMR_LAMBDA is not None:
+        mmr_used = True
+        selected = _apply_mmr(
+            reranked,
+            base_scores=score_map,
+            emb_map=emb_map,
+            k=k,
+            mmr_lambda=MEMORY_MMR_LAMBDA,
+            pool_size=MEMORY_MMR_CANDIDATE_POOL,
+        )
+        if selected:
+            selected_ids = {c["node_id"] for c in selected}
+            reranked = selected + [c for c in reranked if c["node_id"] not in selected_ids]
 
     results: list[Dict[str, Any]] = []
     seen_ctx: set[str] = set()
+    seen_nodes: set[str] = set()
     for c in reranked:
         if len(results) >= k:
             break
         nid = c["node_id"]
+        if nid in seen_nodes:
+            continue
         cid = c["conversation_id"]
         title = (c.get("title") or "").strip() or chatgpt_get_conversation_title(conn, cid)
         ctx = chatgpt_context_window(conn, nid, up=context_up, down=context_down)
@@ -239,12 +307,14 @@ def memory_search_graph_tool(
         if digest in seen_ctx:
             continue
         seen_ctx.add(digest)
+        seen_nodes.add(nid)
         results.append(
             {
                 "node_id": nid,
                 "conversation_id": cid,
                 "title": title,
                 "context": context_text,
+                "create_time": c.get("create_time"),
             }
         )
 
@@ -259,6 +329,9 @@ def memory_search_graph_tool(
             "candidate_limit": candidate_limit,
             "candidates": len(cands),
             "used_embeddings": bool(use_embeddings and emb_map),
+            "mmr_used": mmr_used,
+            "mmr_lambda": MEMORY_MMR_LAMBDA,
+            "mmr_pool": MEMORY_MMR_CANDIDATE_POOL,
             "top_scores": debug_scores,
         }
     return out

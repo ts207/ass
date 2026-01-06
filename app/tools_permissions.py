@@ -1,3 +1,4 @@
+import json
 from typing import Any, Dict, Optional
 
 from app.tools_core import _now_iso
@@ -76,3 +77,109 @@ def permissions_set(
     )
     conn.commit()
     return {"user_id": user_id, "permissions": updated}
+
+
+def tool_policy_set(
+    conn,
+    *,
+    user_id: str,
+    agent: str,
+    tool_name: str,
+    allow: bool,
+    constraints: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    agent_val = (agent or "").strip().lower()
+    if agent_val not in ("life", "health", "ds", "code", "general", "any"):
+        raise ValueError("agent must be one of: life, health, ds, code, general, any")
+    tool = (tool_name or "").strip()
+    if not tool:
+        raise ValueError("tool_name is required")
+    now = _now_iso()
+    constraints_json = json.dumps(constraints, ensure_ascii=False) if constraints else None
+    conn.execute(
+        """
+        INSERT INTO tool_policies (user_id, agent, tool_name, allow, constraints_json, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, agent, tool_name) DO UPDATE SET
+          allow=excluded.allow,
+          constraints_json=excluded.constraints_json,
+          updated_at=excluded.updated_at
+        """,
+        (user_id, agent_val, tool, 1 if allow else 0, constraints_json, now),
+    )
+    conn.commit()
+    return {
+        "user_id": user_id,
+        "agent": agent_val,
+        "tool_name": tool,
+        "allow": bool(allow),
+        "constraints": constraints or {},
+    }
+
+
+def tool_policy_list(
+    conn,
+    *,
+    user_id: str,
+    agent: Optional[str] = None,
+    limit: int = 200,
+) -> Dict[str, Any]:
+    lim = max(1, min(int(limit or 200), 500))
+    params = [user_id]
+    where = "user_id=?"
+    if agent:
+        where += " AND agent=?"
+        params.append(agent.strip().lower())
+    rows = conn.execute(
+        f"SELECT agent, tool_name, allow, constraints_json, updated_at FROM tool_policies WHERE {where} "
+        "ORDER BY updated_at DESC LIMIT ?",
+        (*params, lim),
+    ).fetchall()
+    entries = []
+    for r in rows:
+        constraints = None
+        raw = r["constraints_json"]
+        if raw:
+            try:
+                constraints = json.loads(raw)
+            except Exception:
+                constraints = None
+        entries.append(
+            {
+                "agent": r["agent"],
+                "tool_name": r["tool_name"],
+                "allow": bool(r["allow"]),
+                "constraints": constraints,
+                "updated_at": r["updated_at"],
+            }
+        )
+    return {"entries": entries}
+
+
+def get_tool_policy(conn, *, user_id: str, agent: str, tool_name: str) -> Optional[Dict[str, Any]]:
+    agent_val = (agent or "").strip().lower() or "general"
+    tool = (tool_name or "").strip()
+    if not tool:
+        return None
+    row = conn.execute(
+        "SELECT allow, constraints_json FROM tool_policies WHERE user_id=? AND agent=? AND tool_name=?",
+        (user_id, agent_val, tool),
+    ).fetchone()
+    if not row and agent_val != "any":
+        row = conn.execute(
+            "SELECT allow, constraints_json FROM tool_policies WHERE user_id=? AND agent='any' AND tool_name=?",
+            (user_id, tool),
+        ).fetchone()
+    if not row:
+        return None
+    constraints = None
+    raw = row["constraints_json"]
+    if raw:
+        try:
+            constraints = json.loads(raw)
+        except Exception:
+            constraints = None
+    return {
+        "allow": bool(row["allow"]),
+        "constraints": constraints,
+    }

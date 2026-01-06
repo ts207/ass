@@ -1,9 +1,8 @@
-import json
 import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Dict, Tuple
 from urllib.request import Request, urlopen
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
