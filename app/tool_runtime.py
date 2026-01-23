@@ -97,6 +97,8 @@ def call_tool(name: str, args: Dict[str, Any], *, conn, user_id: str, agent: str
             raise ToolError("Permission denied: this tool requires permissions_set(mode='write').")
         if "network" in caps and not perms.get("allow_network"):
             raise ToolError("Permission denied: this tool requires permissions_set(..., allow_network=true).")
+        if "fs_read" in caps and not perms.get("allow_fs_read"):
+            raise ToolError("Permission denied: this tool requires permissions_set(..., allow_fs_read=true).")
         if "fs_write" in caps and not perms.get("allow_fs_write"):
             raise ToolError("Permission denied: this tool requires permissions_set(..., allow_fs_write=true).")
         if "shell" in caps and not perms.get("allow_shell"):
@@ -124,6 +126,7 @@ def call_tool(name: str, args: Dict[str, Any], *, conn, user_id: str, agent: str
                 user_id=user_id,
                 mode=args["mode"],
                 allow_network=args.get("allow_network"),
+                allow_fs_read=args.get("allow_fs_read"),
                 allow_fs_write=args.get("allow_fs_write"),
                 allow_shell=args.get("allow_shell"),
                 allow_exec=args.get("allow_exec"),
@@ -389,6 +392,12 @@ def call_tool(name: str, args: Dict[str, Any], *, conn, user_id: str, agent: str
             out = t.search_code(query=args["query"], path=args.get("path"), limit=int(args.get("limit", 50)))
         elif name == "open_file":
             out = t.open_file(path=args["path"], start_line=int(args.get("start_line", 1)), end_line=int(args.get("end_line", 200)))
+        elif name == "list_files":
+            out = t.list_files(
+                path=args["path"],
+                glob=args.get("glob"),
+                limit=int(args.get("limit", 200)),
+            )
         elif name == "apply_patch":
             out = t.apply_patch(args["patch"])
         elif name == "run_command":

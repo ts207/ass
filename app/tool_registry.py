@@ -66,6 +66,13 @@ FS_WRITE_TOOLS: Set[str] = {
     "clone_repo",
 }
 
+FS_READ_TOOLS: Set[str] = {
+    "open_file",
+    "list_files",
+    "download_file",
+    "upload_file",
+}
+
 SHELL_TOOLS: Set[str] = {
     "search_code",
     "run_command",
@@ -109,6 +116,8 @@ def _capabilities_for(tool_name: str) -> List[str]:
         caps.add("write")
     if tool_name in NETWORK_TOOLS:
         caps.add("network")
+    if tool_name in FS_READ_TOOLS:
+        caps.add("fs_read")
     if tool_name in FS_WRITE_TOOLS:
         caps.add("fs_write")
     if tool_name in SHELL_TOOLS:

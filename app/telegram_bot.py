@@ -54,8 +54,9 @@ from app.db import (
     record_turn_memory_usage,
     record_turn_tool_usage,
     record_turn_token_usage,
+    record_turn_router_decision,
 )
-from app.tool_loop import run_with_tools
+from app.tool_loop import run_with_coordinator, run_router
 from app.tool_runtime import call_tool
 from app.tool_schemas import GENERAL_TOOLS
 from app.tools import memory_search_graph_tool
@@ -69,8 +70,24 @@ logger = logging.getLogger(__name__)
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 REQUEST_BUDGET = int(MODEL_CONTEXT_TOKENS * REQUEST_BUDGET_FRACTION)
 ENCODING = _get_encoding()
-OPENAI_CLIENT = OpenAI()
+_OPENAI_CLIENT: OpenAI | None = None
 _DB_READY = False
+
+
+def _get_openai_client() -> OpenAI:
+    """
+    Lazily create the OpenAI client so importing this module doesn't require OPENAI_API_KEY.
+    """
+    global _OPENAI_CLIENT
+    if _OPENAI_CLIENT is not None:
+        return _OPENAI_CLIENT
+    try:
+        _OPENAI_CLIENT = OpenAI()
+    except Exception as e:
+        raise RuntimeError(
+            "OpenAI client init failed. Set OPENAI_API_KEY (e.g. in a .env file) and retry."
+        ) from e
+    return _OPENAI_CLIENT
 
 
 def _init_db_if_needed():
@@ -130,7 +147,7 @@ def _general_system_instructions(profile: Dict[str, str]) -> str:
         "You are the Coordinator (General) agent. You are chatting with the user via Telegram; keep replies concise and actionable. "
         "Route specialized tasks to life/health/ds/code using delegate_agent. "
         "Use your own tools (web_search, fetch_url, extract_text, kb_search) for research and summaries. "
-        "If a tool errors due to permissions, explain how to enable with permissions_set (mode, allow_network, allow_fs_write, allow_shell, allow_exec). "
+        "If a tool errors due to permissions, explain how to enable with permissions_set (mode, allow_network, allow_fs_read, allow_fs_write, allow_shell, allow_exec). "
         "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile. "
         f"User timezone: {tz}."
     )
@@ -159,6 +176,7 @@ def _run_general_agent(conn, *, user_id: str, text: str, debug: bool = False) ->
         agent_convo = create_conversation(conn, user_id, title=f"{agent} thread")
         set_agent_conversation_id(conn, user_id, agent, agent_convo)
 
+    client = _get_openai_client()
     profile = get_user_profile(conn, user_id)
     system_instructions = _general_system_instructions(profile or {})
 
@@ -210,7 +228,7 @@ def _run_general_agent(conn, *, user_id: str, text: str, debug: bool = False) ->
 
     history = _ensure_budget_with_summary(
         conn,
-        OPENAI_CLIENT,
+        client,
         MODEL,
         agent_convo,
         system_instructions,
@@ -230,17 +248,41 @@ def _run_general_agent(conn, *, user_id: str, text: str, debug: bool = False) ->
         enc=ENCODING,
     )
 
+    router_decision = {
+        "primary_agent": agent,
+        "need_tools": False,
+        "proposed_tools": [],
+        "task_type": "analyze",
+        "confidence": 0.0,
+    }
+    router_raw = ""
+    try:
+        router_decision, router_raw, _ = run_router(
+            client=client,
+            model=MODEL,
+            user_text=text,
+            debug=debug,
+        )
+    except Exception as e:
+        if debug:
+            logger.warning("router failed: %s", e)
+
+    tool_required = bool(router_decision.get("need_tools"))
+    task_type = router_decision.get("task_type")
+
     tool_events = []
     usage_stats = {}
     try:
-        final_text, _, tool_events, usage_stats = run_with_tools(
-            client=OPENAI_CLIENT,
+        final_text, tool_events, usage_stats = run_with_coordinator(
+            client=client,
             model=MODEL,
             tools_schema=GENERAL_TOOLS,
             input_items=input_items,
             conn=conn,
             user_id=user_id,
             agent=agent,
+            tool_required=tool_required,
+            task_type=task_type,
             debug=debug,
             call_tool_fn=call_tool,
         )
@@ -254,14 +296,16 @@ def _run_general_agent(conn, *, user_id: str, text: str, debug: bool = False) ->
                 budget_tokens=reduced_budget,
                 enc=ENCODING,
             )
-            final_text, _, tool_events, usage_stats = run_with_tools(
-                client=OPENAI_CLIENT,
+            final_text, tool_events, usage_stats = run_with_coordinator(
+                client=client,
                 model=MODEL,
                 tools_schema=GENERAL_TOOLS,
                 input_items=input_items,
                 conn=conn,
                 user_id=user_id,
                 agent=agent,
+                tool_required=tool_required,
+                task_type=task_type,
                 debug=debug,
                 call_tool_fn=call_tool,
             )
@@ -270,6 +314,17 @@ def _run_general_agent(conn, *, user_id: str, text: str, debug: bool = False) ->
 
     user_msg_id = add_message(conn, agent_convo, "user", f"{agent}: {text}")
     add_message(conn, agent_convo, "assistant", final_text or "")
+    try:
+        record_turn_router_decision(
+            conn,
+            conversation_id=agent_convo,
+            turn_id=user_msg_id,
+            agent=agent,
+            decision=router_decision,
+            raw_output=router_raw,
+        )
+    except Exception:
+        pass
     if tool_events:
         try:
             record_turn_tool_usage(
@@ -315,6 +370,11 @@ def handle_user_text(user_id: str, text: str, *, debug: bool = False) -> str:
     _init_db_if_needed()
     conn = connect(DB_PATH, check_same_thread=False)
     try:
+        try:
+            _get_openai_client()
+        except Exception as e:
+            return str(e)
+
         requests = split_prefixed_requests(text, default_agent="general")
         responses: List[str] = []
         for agent, chunk in requests:

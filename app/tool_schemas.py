@@ -90,6 +90,7 @@ permissions_set = {
         "properties": {
             "mode": {"type": "string", "enum": ["read", "write"]},
             "allow_network": {"type": "boolean", "description": "Allow network access for tools like fetch_url/web_search."},
+            "allow_fs_read": {"type": "boolean", "description": "Allow reading files from disk (open_file, list_files, download_file)."},
             "allow_fs_write": {"type": "boolean", "description": "Allow writing files to disk (docs export, code apply_patch)."},
             "allow_shell": {"type": "boolean", "description": "Allow running shell commands (run_command, run_tests, git)."},
             "allow_exec": {"type": "boolean", "description": "Allow executing code snippets (run_python/run_r)."},
@@ -756,7 +757,7 @@ write_table = {
 upload_file = {
     "type": "function",
     "name": "upload_file",
-    "description": "Copy a local file into the assistant's data area (write mode required).",
+    "description": "Copy a local file into the assistant's data area (allow_fs_read + allow_fs_write required).",
     "parameters": {
         "type": "object",
         "properties": {"source_path": {"type": "string"}, "dest_name": {"type": "string"}},
@@ -767,7 +768,7 @@ upload_file = {
 download_file = {
     "type": "function",
     "name": "download_file",
-    "description": "Return metadata for a file path under the assistant data area (read-only; no binary transfer).",
+    "description": "Return metadata for a file path under the assistant data area (allow_fs_read required; no binary transfer).",
     "parameters": {
         "type": "object",
         "properties": {"path": {"type": "string"}},
@@ -823,7 +824,7 @@ search_code = {
 open_file = {
     "type": "function",
     "name": "open_file",
-    "description": "Read a file from disk (best-effort; restricted to workspace).",
+    "description": "Read a file from disk (allow_fs_read required; restricted to workspace).",
     "parameters": {
         "type": "object",
         "properties": {
@@ -835,10 +836,25 @@ open_file = {
     },
 }
 
+list_files = {
+    "type": "function",
+    "name": "list_files",
+    "description": "List files and directories under a path (allow_fs_read required; read-only).",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "glob": {"type": "string", "description": "Optional glob pattern (e.g., '*.csv')."},
+            "limit": {"type": "integer", "default": 200, "minimum": 1, "maximum": 1000},
+        },
+        "required": ["path"],
+    },
+}
+
 apply_patch_tool = {
     "type": "function",
     "name": "apply_patch",
-    "description": "Apply a unified diff patch using git apply (filesystem + shell permission required).",
+    "description": "Apply a unified diff patch using git apply (allow_fs_write + allow_shell required).",
     "parameters": {"type": "object", "properties": {"patch": {"type": "string"}}, "required": ["patch"]},
 }
 
@@ -1033,6 +1049,7 @@ DS_TOOLS = [
     },
     query_sql,
     read_table,
+    list_files,
     write_table,
     upload_file,
     download_file,
@@ -1054,6 +1071,7 @@ CODE_TOOLS = [
     log_action,
     search_code,
     open_file,
+    list_files,
     apply_patch_tool,
     run_command,
     clone_repo,
@@ -1076,6 +1094,7 @@ GENERAL_TOOLS = [
     web_search,
     fetch_url,
     extract_text,
+    list_files,
     kb_search,
     kb_get_doc,
     memory_search_graph,

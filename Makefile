@@ -6,3 +6,4 @@ lint:
 
 db-tables:
 	sqlite3 data/assistant.sqlite3 ".tables"
+

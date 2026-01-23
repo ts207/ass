@@ -17,6 +17,7 @@ python -m pip install -r requirements.txt
 cat > .env <<'EOF'
 OPENAI_API_KEY=sk-REPLACE_ME
 EOF
+# Or: `cp .env.example .env` then edit.
 
 python -m app.chat
 ```
@@ -82,7 +83,7 @@ Mount `data/` as a volume if you want persistence outside the container.
 - [ ] Add `.env` with `OPENAI_API_KEY=...` (and SMTP/IMAP if using email)
 - [ ] Initialize DB: `python - <<'PY'\nfrom pathlib import Path\nfrom app.db import connect, init_db, run_migrations\nschema = Path('app/schema.sql').read_text(encoding='utf-8')\nconn = connect('data/assistant.sqlite3'); init_db(conn, schema); run_migrations(conn); conn.close()\nPY`
 - [ ] Set your profile timezone: `general: save my timezone as <IANA>` in CLI/Streamlit
-- [ ] Decide permissions: enable only what you need (`/perm net on|off`, `/perm fs on|off`, `/perm shell on|off`, `/perm exec on|off`)
+- [ ] Decide permissions: enable only what you need (`/perm net on|off`, `/perm fs on|off`, `/perm fsw on|off`, `/perm shell on|off`, `/perm exec on|off`)
 - [ ] Optional: enable systemd service (`systemd/ass.service`) or run Streamlit (`streamlit run ui_streamlit.py`)
 
 ## How It Works (Architecture)
@@ -102,7 +103,8 @@ Mount `data/` as a volume if you want persistence outside the container.
 - Health: `health: log_metric {"metric":"sleep_hours","value":7.5}`; `health: add a med schedule for atenolol 50mg at 08:00 and 20:00`
 - General planning: `general: plan my week with 3 priorities and create tasks`
 - Web (needs `/perm net on`): `general: web_search latest NICE guideline on hypertension`
-- Code (needs `/perm shell on` + `/perm fs on`): `code: search_code {"query":"TODO","path":"app"}`
+- Code search (needs `/perm shell on`): `code: search_code {"query":"TODO","path":"app"}`
+- Code file read (needs `/perm fs on`): `code: open_file {"path":"README.md","start_line":1,"end_line":80}`
 
 ## Operations
 
@@ -141,7 +143,7 @@ Streamlit shows collapsible “Memory used” and “Memory debug (last turn)”
 
 - **Agents**: life (tasks/reminders/calendar/contacts/docs/expenses), health (metrics/meds/appointments/meals/workouts), ds (courses/SQL/runs), code (dev helper), general (coordinator + web/kb).
 - **Storage**: Single SQLite DB (`data/assistant.sqlite3`) for conversations, reminders, tasks, contacts, docs, expenses, health logs, DS runs, user profile, permissions, audit log, and imported ChatGPT memory.
-- **Safety**: Permission gates (`mode`, `allow_network`, `allow_fs_write`, `allow_shell`, `allow_exec`) + audit log.
+- **Safety**: Permission gates (`mode`, `allow_network`, `allow_fs_read`, `allow_fs_write`, `allow_shell`, `allow_exec`) + audit log.
 - **Interfaces**: CLI (`python -m app.chat`) with reminder watcher; Streamlit UI (`ui_streamlit.py`); Docker/systemd options.
 
 ## Permissions (Safety Controls)
@@ -149,7 +151,7 @@ Streamlit shows collapsible “Memory used” and “Memory debug (last turn)”
 Tools are gated by a simple permissions model:
 
 - `mode`: `read` or `write`
-- capability flags: `allow_network`, `allow_fs_write`, `allow_shell`, `allow_exec`
+- capability flags: `allow_network`, `allow_fs_read`, `allow_fs_write`, `allow_shell`, `allow_exec`
 
 CLI quick controls:
 
@@ -157,7 +159,8 @@ CLI quick controls:
 /perm                # show current permissions
 /perm read|write     # set mode
 /perm net on|off     # allow network tools (fetch_url/web_search, etc)
-/perm fs on|off      # allow filesystem writes (export_pdf, apply_patch)
+/perm fs on|off      # allow filesystem reads (open_file, list_files, download_file)
+/perm fsw on|off     # allow filesystem writes (export_pdf, apply_patch, upload_file)
 /perm shell on|off   # allow shell tools (search_code, run_command, git)
 /perm exec on|off    # allow code execution tools (run_python)
 ```
@@ -200,35 +203,27 @@ Eval harness (iterate on retrieval quality):
 python scripts/eval_memory.py --queries queries.txt --debug
 ```
 
-## Sessionization Analytics
+## ChatGPT Export Analytics (Deterministic)
 
-Generate session + conversation aggregates from `data/messages_clean.parquet`:
+Place your export under `data/imports/` (recommended):
+
+- `data/imports/conversations.json` (preferred)
+- `data/imports/chat.html` (fallback)
+
+Run:
 
 ```bash
-.venv/bin/python data/sessionization.py
+python scripts/analyze_export.py \
+  --json data/imports/conversations.json \
+  --html data/imports/chat.html \
+  --outdir data/exports/run_001
 ```
 
-Outputs (gap-specific unless noted):
-- `data/conversation_stats.parquet` (conversation metrics; `conversation_*` columns)
-- `data/sessions_gap15m.parquet`, `data/sessions_gap30m.parquet`, `data/sessions_gap60m.parquet`
-- `data/sessionization_summary_gap15m.json`, `data/sessionization_summary_gap30m.json`, `data/sessionization_summary_gap60m.json`
-- `data/session_kpis_gap15m.csv`, `data/session_kpis_gap30m.csv`, `data/session_kpis_gap60m.csv`
-- `data/session_gap_comparison.csv` + `data/plot_session_gap_comparison.png`
-- Outliers: `data/outliers_conversations_wallclock_top50.csv`, `data/outliers_sessions_wallclock_gap{gap}m_top50.csv`, `data/outliers_sessions_active_gap{gap}m_top50.csv`
-- Quality checks: `data/quality_checks_gap{gap}m.json` + non-monotonic CSVs if present
-- Manifests: `data/manifest_gap{gap}m.json`
+Outputs are written under `data/exports/run_001/`:
 
-Definitions:
-- `conversation_wallclock_span_min` = `conversation_end - conversation_start`
-- `session_wallclock_span_min` = `session_end - session_start`
-- Session gap threshold: 15/30/60 minutes (set in `SESSION_GAPS_MIN`)
-- Active duration caps each inter-message gap by `ACTIVE_GAP_CAP_MIN` minutes
-
-Key results (gap 30m from current data):
-- p99 session wall-clock span: 87.74 minutes
-- p99 session active duration: 61.10 minutes
-- p99 conversation wall-clock span: 7961.11 minutes (~132.7 hours)
-- p99 sessions per conversation: 5
+- `normalized/`: `conversations.parquet`, `messages.parquet`
+- `features/`: `messages_features.parquet`, `session_features.csv`, `daily_features.csv`, plus topic/transition features
+- `report/`: `report.md`, `user_profile.json`, `user_profile.md`, `figures/*.png`
 
 ## Profile Memory (Stable Facts)
 
@@ -258,7 +253,7 @@ If `tiktoken` is installed, token budgets are more accurate; otherwise the app f
 
 Keep exports and secrets out of git:
 
-- `.env`, `data/assistant.sqlite3`, `data/import/`, `conversations.json`, `chat.html`, `*.zip` are ignored by `.gitignore`.
+- `.env`, `data/assistant.sqlite3`, `data/imports/`, `conversations.json`, `chat.html`, `*.zip` are ignored by `.gitignore`.
 
 ## Outlook / Recommended Updates
 

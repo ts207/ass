@@ -1,9 +1,6 @@
-import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
-
-os.environ.setdefault("OPENAI_API_KEY", "test-key")
 
 from app import telegram_bot
 
@@ -99,3 +96,4 @@ class HandleMessageTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -517,6 +517,46 @@ def record_turn_token_usage(
     conn.commit()
 
 
+def record_turn_router_decision(
+    conn: sqlite3.Connection,
+    *,
+    conversation_id: str,
+    turn_id: str,
+    agent: str,
+    decision: Dict[str, Any],
+    raw_output: str | None = None,
+) -> None:
+    now = _now_iso()
+    decision_payload = dict(decision or {})
+    if raw_output:
+        decision_payload["raw_output"] = raw_output
+    proposed = decision_payload.get("proposed_tools")
+    proposed_json = json.dumps(proposed, ensure_ascii=False) if proposed is not None else None
+    decision_json = json.dumps(decision_payload, ensure_ascii=False)
+    conn.execute(
+        "DELETE FROM turn_router_decisions WHERE conversation_id=? AND turn_id=?",
+        (conversation_id, turn_id),
+    )
+    conn.execute(
+        "INSERT INTO turn_router_decisions "
+        "(id, conversation_id, turn_id, agent, need_tools, task_type, confidence, proposed_tools_json, decision_json, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            f"trd_{uuid.uuid4().hex}",
+            conversation_id,
+            turn_id,
+            agent,
+            1 if decision_payload.get("need_tools") else 0,
+            decision_payload.get("task_type"),
+            float(decision_payload.get("confidence")) if decision_payload.get("confidence") is not None else None,
+            _truncate_json_str(proposed_json) if proposed_json else None,
+            _truncate_json_str(decision_json),
+            now,
+        ),
+    )
+    conn.commit()
+
+
 def get_turn_token_usage(
     conn: sqlite3.Connection,
     conversation_id: str,
@@ -573,6 +613,31 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE reminders ADD COLUMN fired_at TEXT")
     if _has_column(conn, "reminders", "notes") and not _has_column(conn, "reminders", "channels_json"):
         conn.execute("ALTER TABLE reminders ADD COLUMN channels_json TEXT")
+
+    # Permissions: add filesystem read consent flag
+    if _has_column(conn, "user_permissions", "allow_fs_write") and not _has_column(conn, "user_permissions", "allow_fs_read"):
+        conn.execute("ALTER TABLE user_permissions ADD COLUMN allow_fs_read INTEGER NOT NULL DEFAULT 0")
+        conn.execute("UPDATE user_permissions SET allow_fs_read=allow_fs_write")
+
+    # Router decisions (per turn)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS turn_router_decisions ("
+        "id TEXT PRIMARY KEY, "
+        "conversation_id TEXT NOT NULL, "
+        "turn_id TEXT NOT NULL, "
+        "agent TEXT NOT NULL, "
+        "need_tools INTEGER, "
+        "task_type TEXT, "
+        "confidence REAL, "
+        "proposed_tools_json TEXT, "
+        "decision_json TEXT NOT NULL, "
+        "created_at TEXT NOT NULL, "
+        "FOREIGN KEY(conversation_id) REFERENCES conversations(id))"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_turn_router_decisions_turn "
+        "ON turn_router_decisions(conversation_id, turn_id)"
+    )
 
     # Code progress table (kept for legacy logging)
     exists_code = conn.execute(
@@ -857,6 +922,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         "user_id TEXT PRIMARY KEY, "
         "mode TEXT NOT NULL CHECK(mode IN ('read','write')), "
         "allow_network INTEGER NOT NULL DEFAULT 0, "
+        "allow_fs_read INTEGER NOT NULL DEFAULT 0, "
         "allow_fs_write INTEGER NOT NULL DEFAULT 0, "
         "allow_shell INTEGER NOT NULL DEFAULT 0, "
         "allow_exec INTEGER NOT NULL DEFAULT 0, "

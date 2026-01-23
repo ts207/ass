@@ -33,8 +33,9 @@ from .db import (
     record_turn_memory_usage,
     record_turn_tool_usage,
     record_turn_token_usage,
+    record_turn_router_decision,
 )
-from .tool_loop import run_with_tools
+from .tool_loop import run_with_coordinator, run_router
 from .tools_permissions import get_permissions
 from .tool_runtime import call_tool
 from .tool_schemas import LIFE_TOOLS, HEALTH_TOOLS, DS_TOOLS, CODE_TOOLS, GENERAL_TOOLS
@@ -302,7 +303,12 @@ def main():
     args = _parse_args()
     debug = args.debug
 
-    client = OpenAI()
+    try:
+        client = OpenAI()
+    except Exception as e:
+        raise SystemExit(
+            "OpenAI client init failed. Set OPENAI_API_KEY (e.g. in a .env file) and retry."
+        ) from e
     enc = _get_encoding()
     REQUEST_BUDGET = int(MODEL_CONTEXT_TOKENS * REQUEST_BUDGET_FRACTION)
     user_id = "local_user"
@@ -364,33 +370,70 @@ def main():
                     continue
 
                 existing = permissions_get(conn, user_id=user_id)["permissions"]
-                mode = existing.get("mode", "write")
-                if len(parts) == 2 and parts[1] in ("read", "write"):
-                    mode = parts[1]
+                mode = existing.get("mode", "read")
+
+                def _usage() -> None:
+                    print(
+                        "Usage: /perm [read|write] OR /perm {net|fs|fsw|shell|exec} {on|off} OR /perm fs {read|write} {on|off} OR /perm"
+                    )
+
+                args = parts[1:]
+                if len(args) == 1 and "=" in args[0]:
+                    left, right = args[0].split("=", 1)
+                    args = [left, right]
+
+                if len(args) >= 1 and args[0] in ("read", "write"):
+                    mode = args[0]
                     updated = permissions_set(conn, user_id=user_id, mode=mode)
                     print(json.dumps(updated, ensure_ascii=False, indent=2))
                     continue
 
-                if len(parts) == 3 and parts[2] in ("on", "off"):
-                    flag = parts[1].lower()
-                    val = parts[2] == "on"
+                if len(args) == 2 and args[0] in ("read", "write") and args[1] in ("on", "off"):
+                    mode = args[0]
+                    updated = permissions_set(conn, user_id=user_id, mode=mode)
+                    print(json.dumps(updated, ensure_ascii=False, indent=2))
+                    continue
+
+                # /perm fs read on|off  (and /perm fs=read)
+                if len(args) == 2 and args[0].lower() in ("fs", "files", "file", "filesystem") and args[1] in ("read", "write"):
+                    args = [args[0], args[1], "on"]
+                if len(args) == 3 and args[0].lower() in ("fs", "files", "file", "filesystem") and args[2] in ("on", "off"):
+                    scope = args[1].lower()
+                    val = args[2] == "on"
+                    kwargs = {"mode": mode}
+                    if scope == "read":
+                        kwargs["allow_fs_read"] = val
+                    elif scope == "write":
+                        kwargs["allow_fs_write"] = val
+                    else:
+                        _usage()
+                        continue
+                    updated = permissions_set(conn, user_id=user_id, **kwargs)
+                    print(json.dumps(updated, ensure_ascii=False, indent=2))
+                    continue
+
+                if len(args) == 2 and args[1] in ("on", "off"):
+                    flag = args[0].lower()
+                    val = args[1] == "on"
                     kwargs = {"mode": mode}
                     if flag in ("net", "network"):
                         kwargs["allow_network"] = val
-                    elif flag in ("fs", "files", "file"):
+                    elif flag in ("fs", "files", "file", "filesystem"):
+                        kwargs["allow_fs_read"] = val
+                    elif flag in ("fsw", "fs_write", "fswrite", "filesystem_write", "files_write"):
                         kwargs["allow_fs_write"] = val
                     elif flag in ("shell",):
                         kwargs["allow_shell"] = val
                     elif flag in ("exec", "python"):
                         kwargs["allow_exec"] = val
                     else:
-                        print("Usage: /perm [read|write] OR /perm {net|fs|shell|exec} {on|off} OR /perm")
+                        _usage()
                         continue
                     updated = permissions_set(conn, user_id=user_id, **kwargs)
                     print(json.dumps(updated, ensure_ascii=False, indent=2))
                     continue
 
-                print("Usage: /perm [read|write] OR /perm {net|fs|shell|exec} {on|off} OR /perm")
+                _usage()
                 continue
 
             # --- handle one or more prefixed agent requests ---
@@ -429,7 +472,7 @@ def main():
                         f"You are the Life Manager. User timezone: {tz}. "
                         "You can manage calendar events, tasks, reminders, contacts, documents, and expenses using tools. "
                         "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
-                        "If a tool errors due to permissions, ask the user to enable it via /perm (e.g. /perm net on, /perm fs on, /perm shell on). "
+                        "If a tool errors due to permissions, ask the user to enable it via /perm (e.g. /perm net on, /perm fs on, /perm fsw on, /perm shell on). "
                         "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
                         "\n\nMemory policy: If the user references past context or asks for personalization/continuation, call memory_search_graph before answering. "
                         "Use k=5 candidate_limit=250 context_up=4 context_down=2. "
@@ -454,7 +497,7 @@ def main():
                         "You are the Coding assistant. Help with debugging, architecture, and implementation details. "
                         "When useful, log progress with code_record_progress and review history with code_list_progress. "
                         "If explicitly enabled in permissions, you can search/read files and run safe repo commands via tools. "
-                        "If a tool errors due to permissions, ask the user to enable it via /perm (e.g. /perm shell on, /perm fs on). "
+                        "If a tool errors due to permissions, ask the user to enable it via /perm (e.g. /perm shell on, /perm fs on, /perm fsw on). "
                         "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
                         "\n\nMemory policy: If the user references prior debugging, ongoing work, or asks to continue, call memory_search_graph before answering. "
                         "Use k=5 candidate_limit=250 context_up=6 context_down=2. "
@@ -472,8 +515,9 @@ def main():
                 else:
                     system_instructions = (
                         "You are a Data Science Course Assistant. You can design short courses, serve lessons, grade submissions, and adapt the plan based on progress. "
-                        "You can also query the local SQLite DB, upload files, and log experiment runs using tools. "
-                        "If a tool errors due to permissions, ask the user to enable it via /perm (e.g. /perm exec on for run_python). "
+                        "You can also query the local SQLite DB, list local files, and log experiment runs using tools. "
+                        "If files are needed, ask the user to place them in data/imports/ and use list_files to confirm paths. "
+                        "If a tool errors due to permissions, ask the user to enable it via /perm (e.g. /perm fs on for list_files, /perm exec on for run_python). "
                         "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
                         "\n\nMemory policy: If the user references past work, progress, or asks to continue, call memory_search_graph before answering. "
                         "Use k=5 candidate_limit=250 context_up=6 context_down=2. "
@@ -580,10 +624,32 @@ def main():
                 if debug:
                     print(f"[debug] approx request tokens: {_count_tokens(input_items, enc)}")
 
+                router_decision = {
+                    "primary_agent": agent,
+                    "need_tools": False,
+                    "proposed_tools": [],
+                    "task_type": "analyze",
+                    "confidence": 0.0,
+                }
+                router_raw = ""
+                try:
+                    router_decision, router_raw, _ = run_router(
+                        client=client,
+                        model=MODEL,
+                        user_text=text,
+                        debug=debug,
+                    )
+                except Exception as e:
+                    if debug:
+                        print(f"[debug] router failed: {e}")
+
+                tool_required = bool(router_decision.get("need_tools"))
+                task_type = router_decision.get("task_type")
+
                 tool_events = []
                 usage_stats = {}
                 try:
-                    final_text, _, tool_events, usage_stats = run_with_tools(
+                    final_text, tool_events, usage_stats = run_with_coordinator(
                         client=client,
                         model=MODEL,
                         tools_schema=tools_schema,
@@ -591,6 +657,8 @@ def main():
                         conn=conn,
                         user_id=user_id,
                         agent=agent,
+                        tool_required=tool_required,
+                        task_type=task_type,
                         debug=debug,
                         call_tool_fn=call_tool,
                     )
@@ -610,7 +678,7 @@ def main():
                             budget_tokens=reduced_budget,
                             enc=enc,
                         )
-                        final_text, _, tool_events, usage_stats = run_with_tools(
+                        final_text, tool_events, usage_stats = run_with_coordinator(
                             client=client,
                             model=MODEL,
                             tools_schema=tools_schema,
@@ -618,6 +686,8 @@ def main():
                             conn=conn,
                             user_id=user_id,
                             agent=agent,
+                            tool_required=tool_required,
+                            task_type=task_type,
                             debug=debug,
                             call_tool_fn=call_tool,
                         )
@@ -627,6 +697,17 @@ def main():
                 # Persist each sub-request as its own turn (keeps memory coherent)
                 user_msg_id = add_message(conn, agent_convo, "user", f"{display_agent}: {text}")
                 add_message(conn, agent_convo, "assistant", final_text or "")
+                try:
+                    record_turn_router_decision(
+                        conn,
+                        conversation_id=agent_convo,
+                        turn_id=user_msg_id,
+                        agent=agent,
+                        decision=router_decision,
+                        raw_output=router_raw,
+                    )
+                except Exception:
+                    pass
                 if tool_events:
                     try:
                         record_turn_tool_usage(

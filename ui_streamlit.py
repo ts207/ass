@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 
 import streamlit as st
+from dotenv import load_dotenv
 from openai import OpenAI
 
 from app.config import (
@@ -34,11 +35,14 @@ from app.db import (
     record_turn_tool_usage,
     get_turn_token_usage,
     record_turn_token_usage,
+    record_turn_router_decision,
 )
-from app.tool_loop import run_with_tools
+from app.tool_loop import run_with_coordinator, run_router
 from app.tool_runtime import call_tool
 from app.tool_schemas import LIFE_TOOLS, HEALTH_TOOLS, DS_TOOLS, CODE_TOOLS, GENERAL_TOOLS
 from app.token_utils import try_get_encoding, count_message_tokens, token_len, truncate_to_tokens
+
+load_dotenv()
 
 SCHEMA_PATH = Path("app/schema.sql")
 ENCODING = try_get_encoding()
@@ -103,9 +107,20 @@ def _format_memory_results(results, *, max_chars: int = 6000) -> str:
     return blob
 
 
-def _call_with_context_retry(*, client, model, tools_schema, input_items, conn, user_id, agent: str):
+def _call_with_context_retry(
+    *,
+    client,
+    model,
+    tools_schema,
+    input_items,
+    conn,
+    user_id,
+    agent: str,
+    tool_required: bool,
+    task_type: str | None,
+):
     try:
-        return run_with_tools(
+        final_text, tool_events, usage_stats = run_with_coordinator(
             client=client,
             model=model,
             tools_schema=tools_schema,
@@ -113,34 +128,44 @@ def _call_with_context_retry(*, client, model, tools_schema, input_items, conn, 
             conn=conn,
             user_id=user_id,
             agent=agent,
-            debug=False,
             call_tool_fn=call_tool,
+            tool_required=tool_required,
+            task_type=task_type,
+            debug=False,
         )
+        return final_text, tool_events, usage_stats
     except Exception as e:
         if "context_length_exceeded" not in str(e):
             raise
         reduced_budget = max(4096, int(REQUEST_BUDGET * 0.6))
-        system_msg = input_items[0]["content"] + "\n\nNote: context was trimmed aggressively due to context window limits."
-        # Keep only last few messages + user prompt.
-        history_msgs = [m for m in input_items[1:-1] if isinstance(m, dict) and "role" in m and "content" in m]
-        user_msg = input_items[-1]["content"]
-        trimmed_items = _build_context_token_aware(
-            system_message=system_msg,
-            history_messages=history_msgs[-10:],
-            new_user_text=_truncate_text_to_tokens(user_msg, max(256, reduced_budget // 4)),
+        history = get_recent_messages(conn, st.session_state.convo_id, 12)
+        base_system = ""
+        if input_items and input_items[0].get("role") == "system":
+            base_system = str(input_items[0].get("content") or "")
+        input_items = _build_context_token_aware(
+            system_message=(
+                base_system + "\n\nNote: context was trimmed due to token limits."
+                if base_system
+                else "Note: context was trimmed due to token limits."
+            ),
+            history_messages=history,
+            new_user_text=input_items[-1]["content"],
             budget_tokens=reduced_budget,
         )
-        return run_with_tools(
+        final_text, tool_events, usage_stats = run_with_coordinator(
             client=client,
             model=model,
             tools_schema=tools_schema,
-            input_items=trimmed_items,
+            input_items=input_items,
             conn=conn,
             user_id=user_id,
             agent=agent,
-            debug=False,
             call_tool_fn=call_tool,
+            tool_required=tool_required,
+            task_type=task_type,
+            debug=False,
         )
+        return final_text, tool_events, usage_stats
 
 
 _MEMORY_TRIGGERS = (
@@ -172,13 +197,23 @@ def _should_retrieve_memory(text: str) -> bool:
         return False
     return any(k in t for k in _MEMORY_TRIGGERS)
 
+
 st.set_page_config(page_title="Assistant", layout="wide")
 st.title("Assistant UI")
 
-# --- init singletons ---
+
 @st.cache_resource
 def get_client():
     return OpenAI()
+
+
+def require_client():
+    try:
+        return get_client()
+    except Exception as e:
+        st.error(f"OpenAI client init failed: {e}\n\nSet `OPENAI_API_KEY` (e.g. in a `.env` file) and reload.")
+        st.stop()
+
 
 @st.cache_resource
 def get_conn():
@@ -187,7 +222,7 @@ def get_conn():
     run_migrations(conn)
     return conn
 
-client = get_client()
+
 conn = get_conn()
 user_id = "local_user"
 
@@ -208,7 +243,7 @@ with st.sidebar:
     selected_agent = st.selectbox("Agent", ["general", "life", "health", "ds", "code"], index=0)
     if selected_agent != st.session_state.agent:
         st.session_state.agent = selected_agent
-    # keep a separate conversation thread per agent
+
     agent_convo = get_agent_conversation_id(conn, user_id, st.session_state.agent)
     if not agent_convo:
         agent_convo = create_conversation(conn, user_id, title=f"{st.session_state.agent} thread")
@@ -231,18 +266,45 @@ with st.sidebar:
 
     current_perms = permissions_get(conn, user_id=user_id)["permissions"]
     allow_network = bool(current_perms.get("allow_network"))
-    perm_mode = st.selectbox("Mode", ["read", "write"], index=1 if current_perms.get("mode") == "write" else 0, key="perm_mode")
-    perm_allow_network = st.checkbox("Allow network tools", value=bool(current_perms.get("allow_network")), key="perm_allow_network")
-    perm_allow_fs = st.checkbox("Allow filesystem writes", value=bool(current_perms.get("allow_fs_write")), key="perm_allow_fs_write")
-    perm_allow_shell = st.checkbox("Allow shell commands", value=bool(current_perms.get("allow_shell")), key="perm_allow_shell")
-    perm_allow_exec = st.checkbox("Allow code execution", value=bool(current_perms.get("allow_exec")), key="perm_allow_exec")
+    perm_mode = st.selectbox(
+        "Mode",
+        ["read", "write"],
+        index=1 if current_perms.get("mode") == "write" else 0,
+        key="perm_mode",
+    )
+    perm_allow_network = st.checkbox(
+        "Allow network tools",
+        value=bool(current_perms.get("allow_network")),
+        key="perm_allow_network",
+    )
+    perm_allow_fs_read = st.checkbox(
+        "Allow filesystem reads",
+        value=bool(current_perms.get("allow_fs_read")),
+        key="perm_allow_fs_read",
+    )
+    perm_allow_fs_write = st.checkbox(
+        "Allow filesystem writes",
+        value=bool(current_perms.get("allow_fs_write")),
+        key="perm_allow_fs_write",
+    )
+    perm_allow_shell = st.checkbox(
+        "Allow shell commands",
+        value=bool(current_perms.get("allow_shell")),
+        key="perm_allow_shell",
+    )
+    perm_allow_exec = st.checkbox(
+        "Allow code execution",
+        value=bool(current_perms.get("allow_exec")),
+        key="perm_allow_exec",
+    )
     if st.button("Save permissions"):
         permissions_set(
             conn,
             user_id=user_id,
             mode=perm_mode,
             allow_network=perm_allow_network,
-            allow_fs_write=perm_allow_fs,
+            allow_fs_read=perm_allow_fs_read,
+            allow_fs_write=perm_allow_fs_write,
             allow_shell=perm_allow_shell,
             allow_exec=perm_allow_exec,
         )
@@ -279,44 +341,20 @@ with st.sidebar:
     with st.expander("Memory debug (last turn)", expanded=False):
         meta = {}
         for row in mem_usage:
-            meta = row.get("meta") or {}
-            if meta:
+            if row.get("meta"):
+                meta = row.get("meta") or {}
                 break
         if not meta:
-            if mem_usage:
-                st.caption("No debug details recorded for the last turn.")
-            else:
-                st.caption("No memory retrieval on the last turn.")
+            st.caption("No memory debug recorded for the last turn.")
         else:
-            q = meta.get("query") or {}
-            if q.get("raw"):
-                st.write(f"Query: `{q.get('raw')}`")
-            if q.get("cleaned"):
-                st.write(f"Cleaned: `{q.get('cleaned')}`")
-            if q.get("keywords"):
-                st.write(f"Keywords: `{', '.join(q.get('keywords'))}`")
-            if meta.get("candidates") is not None:
-                st.write(f"Candidates: `{meta.get('candidates')}`")
-            if meta.get("used_embeddings") is not None:
-                st.write(f"Used embeddings: `{meta.get('used_embeddings')}`")
-            if meta.get("mmr_used") is not None:
-                st.write(f"MMR used: `{meta.get('mmr_used')}`")
-            if meta.get("mmr_lambda") is not None:
-                st.write(f"MMR lambda: `{meta.get('mmr_lambda')}`")
-            if meta.get("mmr_pool") is not None:
-                st.write(f"MMR pool: `{meta.get('mmr_pool')}`")
+            st.json(meta)
 
     with st.expander("Tools used (last turn)", expanded=False):
         if not tool_usage:
-            st.caption("No tool calls on the last turn.")
+            st.caption("No tools recorded for the last turn.")
         else:
-            for row in tool_usage:
-                tool_name = row.get("tool_name") or "(unknown)"
-                status = row.get("status") or "ok"
-                duration_ms = row.get("duration_ms")
-                header = f"{tool_name} — {status}"
-                if duration_ms is not None:
-                    header += f" ({duration_ms} ms)"
+            for row in tool_usage[:6]:
+                header = f"{row.get('tool_name')} ({row.get('status')})"
                 st.markdown(f"**{header}**")
                 if row.get("error"):
                     st.caption(f"Error: {row.get('error')}")
@@ -352,7 +390,8 @@ with st.sidebar:
 history = get_recent_messages(conn, st.session_state.convo_id, MAX_HISTORY_MESSAGES)
 
 for m in history:
-    role = m.get("role", "assistant")
+    role = (m.get("role") or "assistant").strip().lower()
+    role = role if role in ("user", "assistant") else "assistant"
     content = m.get("content", "")
     with st.chat_message(role):
         st.markdown(content)
@@ -360,6 +399,7 @@ for m in history:
 # --- chat input ---
 prompt = st.chat_input("Type a message…")
 if prompt:
+    client = require_client()
     agent = st.session_state.agent
     if agent == "life":
         tools_schema = LIFE_TOOLS
@@ -384,7 +424,7 @@ if prompt:
         system_instructions = (
             f"You are the Life Manager. User timezone: {tz}. "
             "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
-            "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
+            "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile. "
             "If a tool errors due to permissions, ask the user to toggle Permissions in the sidebar."
             "\n\nMemory policy: If the user references past context or asks for personalization/continuation, call memory_search_graph before answering. "
             "Use k=5 candidate_limit=250 context_up=4 context_down=2. "
@@ -395,7 +435,7 @@ if prompt:
             f"You are the Health assistant. User timezone: {tz}. "
             "You are not a doctor; give general, evidence-based guidance and encourage professional help for urgent symptoms. "
             "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
-            "If the user explicitly asks to save/update stable facts (timezone, conditions, meds, preferences, goals), call set_profile."
+            "If the user explicitly asks to save/update stable facts (timezone, conditions, meds, preferences, goals), call set_profile. "
             "If a tool errors due to permissions, ask the user to toggle Permissions in the sidebar."
             "\n\nMemory policy: If the user references past symptoms, treatments, labs, routines, or asks to continue a plan, call memory_search_graph before answering. "
             "Use k=5 candidate_limit=250 context_up=4 context_down=2. "
@@ -405,7 +445,7 @@ if prompt:
         system_instructions = (
             "You are the Coding assistant. Help with debugging, architecture, and implementation details. "
             "When useful, log progress with code_record_progress and review history with code_list_progress. "
-            "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
+            "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile. "
             "If a tool errors due to permissions, ask the user to toggle Permissions in the sidebar."
             "\n\nMemory policy: If the user references prior debugging, ongoing work, or asks to continue, call memory_search_graph before answering. "
             "Use k=5 candidate_limit=250 context_up=6 context_down=2. "
@@ -422,7 +462,7 @@ if prompt:
     else:
         system_instructions = (
             "You are the Applied Data Science Tutor and assistant. Focus on lab-based learning. "
-            "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
+            "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile. "
             "If a tool errors due to permissions, ask the user to toggle Permissions in the sidebar."
             "\n\nMemory policy: If the user references past work, progress, or asks to continue, call memory_search_graph before answering. "
             "Use k=5 candidate_limit=250 context_up=6 context_down=2. "
@@ -439,7 +479,6 @@ if prompt:
                 + profile_blob
             )
 
-    # Auto-retrieve from imported ChatGPT export memory and inject as system context.
     mem_results = []
     mem_debug = None
     mem_search_ran = False
@@ -486,11 +525,9 @@ if prompt:
         mem_search_ran = False
         st.session_state["memory_injection_error"] = str(e)
 
-    # show user message immediately
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # build input items (system + db history + new user msg)
     max_user_tokens = max(256, REQUEST_BUDGET // 4)
     prompt_for_model = _truncate_text_to_tokens(prompt, max_user_tokens)
 
@@ -501,7 +538,28 @@ if prompt:
         budget_tokens=REQUEST_BUDGET,
     )
 
-    final_text, _, tool_events, usage_stats = _call_with_context_retry(
+    router_decision = {
+        "primary_agent": agent,
+        "need_tools": False,
+        "proposed_tools": [],
+        "task_type": "analyze",
+        "confidence": 0.0,
+    }
+    router_raw = ""
+    try:
+        router_decision, router_raw, _ = run_router(
+            client=client,
+            model=MODEL,
+            user_text=prompt,
+            debug=False,
+        )
+    except Exception:
+        pass
+
+    tool_required = bool(router_decision.get("need_tools"))
+    task_type = router_decision.get("task_type")
+
+    final_text, tool_events, usage_stats = _call_with_context_retry(
         client=client,
         model=MODEL,
         tools_schema=tools_schema,
@@ -509,11 +567,23 @@ if prompt:
         conn=conn,
         user_id=user_id,
         agent=agent,
+        tool_required=tool_required,
+        task_type=task_type,
     )
 
-    # persist
     user_msg_id = add_message(conn, st.session_state.convo_id, "user", prompt)
     add_message(conn, st.session_state.convo_id, "assistant", final_text or "")
+    try:
+        record_turn_router_decision(
+            conn,
+            conversation_id=st.session_state.convo_id,
+            turn_id=user_msg_id,
+            agent=agent,
+            decision=router_decision,
+            raw_output=router_raw,
+        )
+    except Exception:
+        pass
     if tool_events:
         try:
             record_turn_tool_usage(
@@ -552,7 +622,6 @@ if prompt:
         except Exception:
             pass
 
-    # show assistant
     with st.chat_message("assistant"):
         st.markdown(final_text or "")
 

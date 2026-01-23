@@ -8,7 +8,7 @@ from app.config import MODEL, PROFILE_INJECT_MAX_TOKENS
 from app.token_utils import try_get_encoding, truncate_to_tokens
 from app.tools_core import _http_get, _truncate_json_str
 from app.tools_memory import _get_openai_client
-from app.tool_loop import run_with_tools
+from app.tool_loop import run_with_coordinator, run_router
 
 from app.db import (
     add_message,
@@ -19,6 +19,7 @@ from app.db import (
     set_agent_conversation_id,
     record_turn_tool_usage,
     record_turn_token_usage,
+    record_turn_router_decision,
 )
 
 
@@ -138,7 +139,8 @@ def _agent_system_instructions(agent: str, tz: str) -> str:
         )
     return (
         "You are a Data Science Course Assistant. You can design short courses, serve lessons, grade submissions, and adapt the plan based on progress. "
-        "You can query the local SQLite DB, upload files, and log experiment runs using tools. "
+        "You can query the local SQLite DB, list local files, and log experiment runs using tools. "
+        "If files are needed, ask the user to place them in data/imports/ and use list_files to confirm paths. "
         "If a tool errors due to permissions, explain what must be enabled. "
         "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
         "\n\nMemory policy: If the user references past work, progress, or asks to continue, call memory_search_graph before answering. "
@@ -205,10 +207,31 @@ def delegate_agent(
     client = _get_openai_client()
     tools_schema = _agent_tools_schema(agent_val)
 
+    router_decision = {
+        "primary_agent": agent_val,
+        "need_tools": False,
+        "proposed_tools": [],
+        "task_type": "analyze",
+        "confidence": 0.0,
+    }
+    router_raw = ""
+    try:
+        router_decision, router_raw, _ = run_router(
+            client=client,
+            model=MODEL,
+            user_text=text,
+            debug=False,
+        )
+    except Exception:
+        pass
+
+    tool_required = bool(router_decision.get("need_tools"))
+    task_type = router_decision.get("task_type")
+
     tool_events = []
     usage_stats = {}
     try:
-        final_text, _, tool_events, usage_stats = run_with_tools(
+        final_text, tool_events, usage_stats = run_with_coordinator(
             client=client,
             model=MODEL,
             tools_schema=tools_schema,
@@ -216,12 +239,14 @@ def delegate_agent(
             conn=conn,
             user_id=user_id,
             agent=agent_val,
+            tool_required=tool_required,
+            task_type=task_type,
             debug=False,
             call_tool_fn=call_tool_fn,
         )
     except Exception as e:
         if "context_length_exceeded" in str(e) and history_msgs:
-            final_text, _, tool_events, usage_stats = run_with_tools(
+            final_text, tool_events, usage_stats = run_with_coordinator(
                 client=client,
                 model=MODEL,
                 tools_schema=tools_schema,
@@ -229,6 +254,8 @@ def delegate_agent(
                 conn=conn,
                 user_id=user_id,
                 agent=agent_val,
+                tool_required=tool_required,
+                task_type=task_type,
                 debug=False,
                 call_tool_fn=call_tool_fn,
             )
@@ -237,6 +264,17 @@ def delegate_agent(
 
     user_msg_id = add_message(conn, agent_convo, "user", f"{agent_val}: {text}")
     add_message(conn, agent_convo, "assistant", final_text or "")
+    try:
+        record_turn_router_decision(
+            conn,
+            conversation_id=agent_convo,
+            turn_id=user_msg_id,
+            agent=agent_val,
+            decision=router_decision,
+            raw_output=router_raw,
+        )
+    except Exception:
+        pass
     if tool_events:
         try:
             record_turn_tool_usage(

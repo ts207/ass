@@ -19,3 +19,4 @@ COPY . .
 # Default to Streamlit UI; override CMD for CLI with: docker run ... python -m app.chat
 EXPOSE 8501
 CMD ["streamlit", "run", "ui_streamlit.py"]
+

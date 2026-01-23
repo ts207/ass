@@ -1,5 +1,8 @@
 openai
 python-dotenv
 numpy
+pandas
+pyarrow
+matplotlib
 streamlit
 python-telegram-bot[job-queue]>=20.7

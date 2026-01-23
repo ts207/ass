@@ -1,0 +1,32 @@
+# Environments / caches
+.venv/
+__pycache__/
+*.pyc
+.ruff_cache/
+*.log
+logs/
+cache/
+caches/
+
+# Local data / runtime artifacts
+.env
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+*.db
+
+# Exports / archives
+*.zip
+*.tar.gz
+*.tgz
+*.tar
+
+# Local documents (keep out of git)
+*.doc
+*.docx
+
+# Local scratch/outputs
+attic/
+reports/

@@ -84,6 +84,35 @@ def open_file(path: str, start_line: int = 1, end_line: int = 200) -> Dict[str, 
     return {"path": str(p), "start_line": start, "end_line": end, "text": snippet}
 
 
+def list_files(path: str, glob: str | None = None, limit: int = 200) -> Dict[str, Any]:
+    if not path or not isinstance(path, str):
+        raise ValueError("path is required")
+    lim = max(1, min(int(limit or 200), 1000))
+    root = _safe_resolve(path, root=WORKSPACE_ROOT)
+    if not root.exists():
+        raise ValueError("Path not found.")
+    entries: List[Dict[str, Any]] = []
+    if glob:
+        candidates = root.glob(glob)
+    else:
+        candidates = root.iterdir()
+    for p in candidates:
+        try:
+            stat = p.stat()
+        except Exception:
+            stat = None
+        entries.append(
+            {
+                "path": str(p),
+                "is_dir": p.is_dir(),
+                "size": int(stat.st_size) if stat and p.is_file() else None,
+            }
+        )
+        if len(entries) >= lim:
+            break
+    return {"path": str(root), "glob": glob, "returned": len(entries), "entries": entries}
+
+
 def apply_patch(patch: str) -> Dict[str, Any]:
     if not patch or not isinstance(patch, str):
         raise ValueError("patch is required")

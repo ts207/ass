@@ -190,6 +190,7 @@ CREATE TABLE IF NOT EXISTS user_permissions (
   user_id TEXT PRIMARY KEY,
   mode TEXT NOT NULL CHECK(mode IN ('read','write')),
   allow_network INTEGER NOT NULL DEFAULT 0,
+  allow_fs_read INTEGER NOT NULL DEFAULT 0,
   allow_fs_write INTEGER NOT NULL DEFAULT 0,
   allow_shell INTEGER NOT NULL DEFAULT 0,
   allow_exec INTEGER NOT NULL DEFAULT 0,
@@ -283,6 +284,26 @@ CREATE TABLE IF NOT EXISTS turn_token_usage (
 
 CREATE INDEX IF NOT EXISTS idx_turn_token_usage_turn
 ON turn_token_usage(conversation_id, turn_id);
+
+-- =========================
+-- Turn Router Decisions (routing + tool need)
+-- =========================
+CREATE TABLE IF NOT EXISTS turn_router_decisions (
+  id TEXT PRIMARY KEY,
+  conversation_id TEXT NOT NULL,
+  turn_id TEXT NOT NULL,
+  agent TEXT NOT NULL,
+  need_tools INTEGER,
+  task_type TEXT,
+  confidence REAL,
+  proposed_tools_json TEXT,
+  decision_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_turn_router_decisions_turn
+ON turn_router_decisions(conversation_id, turn_id);
 
 -- =========================
 -- Tool Policies (scoped permissions)
