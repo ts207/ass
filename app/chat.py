@@ -25,8 +25,10 @@ from .db import (
     create_conversation,
     list_conversations,
     add_message,
+    get_conversation_summary,
     get_latest_conversation_id,
     get_agent_conversation_id,
+    get_recent_thread_messages,
     set_agent_conversation_id,
     run_migrations,
     get_user_profile,
@@ -39,7 +41,8 @@ from .tool_loop import run_with_coordinator, run_router
 from .tools_permissions import get_permissions
 from .tool_runtime import call_tool
 from .tool_schemas import LIFE_TOOLS, HEALTH_TOOLS, DS_TOOLS, CODE_TOOLS, GENERAL_TOOLS
-from .token_utils import try_get_encoding, count_message_tokens, token_len, truncate_to_tokens
+from .token_utils import try_get_encoding, count_message_tokens, truncate_to_tokens
+from .thread_summary import build_thread_context, should_force_thread_summary, update_thread_summary
 
 load_dotenv()
 
@@ -86,81 +89,6 @@ def _get_encoding():
 
 def _count_tokens(messages, enc) -> int:
     return count_message_tokens(messages, enc)
-
-
-def _fetch_all_messages(conn, convo_id: str):
-    rows = conn.execute(
-        "SELECT id, role, content FROM messages WHERE conversation_id=? ORDER BY created_at ASC",
-        (convo_id,),
-    ).fetchall()
-    return [{"id": r["id"], "role": r["role"], "content": r["content"]} for r in rows]
-
-
-def _summarize_messages(client: OpenAI, model: str, messages):
-    formatted = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
-    prompt = (
-        "Summarize the following conversation into concise bullet points capturing key facts, decisions, "
-        "and follow-ups. Keep it short and information-dense."
-    )
-    resp = client.responses.create(
-        model=model,
-        input=[
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": formatted},
-        ],
-    )
-    return (resp.output_text or "").strip()
-
-
-def _count_tokens_for_context(messages, system_message: str, enc) -> int:
-    base = [{"role": "system", "content": system_message}]
-    return _count_tokens(base + messages, enc)
-
-
-def _ensure_budget_with_summary(conn, client, model, convo_id: str, system_message: str, budget_tokens: int, enc, user_id: str):
-    messages = _fetch_all_messages(conn, convo_id)
-    while True:
-        total = _count_tokens_for_context(messages, system_message, enc)
-        if total <= budget_tokens:
-            return messages
-        if len(messages) <= 4:
-            return messages
-        chunk = []
-        chunk_tokens = 0
-        target = max(512, budget_tokens // 5)
-        for m in messages:
-            t = token_len(m["role"], enc) + token_len(m["content"], enc)
-            chunk.append(m)
-            chunk_tokens += t
-            if chunk_tokens >= target:
-                break
-        summary = _summarize_messages(client, model, chunk)
-        if not summary:
-            return messages
-        ids = [m["id"] for m in chunk]
-        conn.execute(
-            f"DELETE FROM messages WHERE id IN ({','.join(['?']*len(ids))})",
-            ids,
-        )
-        add_message(conn, convo_id, "system", f"Conversation summary: {summary}")
-        messages = _fetch_all_messages(conn, convo_id)
-
-
-def _build_context_token_aware(system_message: str, history_messages, new_user_text: str, budget_tokens: int, enc):
-    base = [{"role": "system", "content": system_message}]
-    acc_tokens = _count_tokens(base, enc)
-    user_tokens = token_len("user", enc) + token_len(new_user_text, enc)
-    acc_tokens += user_tokens
-
-    selected = []
-    for m in reversed(history_messages):
-        t = token_len(m["role"], enc) + token_len(m["content"], enc)
-        if acc_tokens + t > budget_tokens:
-            break
-        selected.append({"role": m["role"], "content": m["content"]})
-        acc_tokens += t
-    selected.reverse()
-    return base + selected + [{"role": "user", "content": new_user_text}]
 
 
 def _truncate_text_to_tokens(text: str, max_tokens: int, enc) -> str:
@@ -473,7 +401,8 @@ def main():
                         "You can manage calendar events, tasks, reminders, contacts, documents, and expenses using tools. "
                         "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
                         "If a tool errors due to permissions, ask the user to enable it via /perm (e.g. /perm net on, /perm fs on, /perm fsw on, /perm shell on). "
-                        "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
+                        "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile. "
+                        "If the user wants Google Calendar sync or device reminders, call google_calendar_create_event."
                         "\n\nMemory policy: If the user references past context or asks for personalization/continuation, call memory_search_graph before answering. "
                         "Use k=5 candidate_limit=250 context_up=4 context_down=2. "
                         "Life query format: <goal/symptom> <routine> <constraint> <timeframe> (use discriminative nouns). "
@@ -486,7 +415,8 @@ def main():
                         "You can log metrics, meds schedules, appointments, meals, workouts, and screening forms using tools. "
                         "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
                         "If a tool errors due to permissions, ask the user to enable it via /perm (e.g. /perm net on). "
-                        "If the user explicitly asks to save/update stable facts (timezone, conditions, meds, preferences, goals), call set_profile."
+                        "If the user explicitly asks to save/update stable facts (timezone, conditions, meds, preferences, goals), call set_profile. "
+                        "If the user wants Google Calendar sync or device reminders, call google_calendar_create_event."
                         "\n\nMemory policy: If the user references past symptoms, treatments, labs, routines, or asks to continue a plan, call memory_search_graph before answering. "
                         "Use k=5 candidate_limit=250 context_up=4 context_down=2. "
                         "Health query format: <symptom/goal> <med/supplement/routine> <constraint> <timeframe>. "
@@ -525,21 +455,18 @@ def main():
                         "After retrieval: summarize what you found and ground your answer; if memory is weak, say so and suggest what to log next."
                     )
 
+                base_system_instructions = system_instructions
+                profile_blob = ""
                 if profile:
                     profile_blob = json.dumps(profile, ensure_ascii=False, indent=2)
                     profile_blob = _truncate_text_to_tokens(profile_blob, PROFILE_INJECT_MAX_TOKENS, enc)
-                    if profile_blob:
-                        system_instructions = (
-                            system_instructions
-                            + "\n\nUser profile (stable facts, user-provided). Use as ground truth; do not invent missing fields:\n"
-                            + profile_blob
-                        )
 
                 # Auto-retrieve from imported ChatGPT export memory and inject as system context.
                 # This makes memory available even when the model doesn't decide to call the tool.
                 mem_results: list[dict] = []
                 mem_debug = None
                 mem_search_ran = False
+                system_instructions = base_system_instructions
                 try:
                     from app.tools import memory_search_graph_tool
 
@@ -598,28 +525,21 @@ def main():
                     if debug:
                         print(f"[debug] memory injection failed: {e}")
 
-                history = _ensure_budget_with_summary(
-                    conn,
-                    client,
-                    MODEL,
-                    agent_convo,
-                    system_instructions,
-                    REQUEST_BUDGET,
-                    enc,
-                    user_id,
-                )
+                summary_row = get_conversation_summary(conn, agent_convo)
+                summary_text = summary_row["summary"] if summary_row else ""
+                history = get_recent_thread_messages(conn, agent_convo, 20)
 
                 # Ensure a single huge user paste doesn't blow the budget by itself.
                 # Leave headroom for system + tool reasoning.
                 max_user_tokens = max(256, REQUEST_BUDGET // 4)
                 text_for_model = _truncate_text_to_tokens(text, max_user_tokens, enc)
 
-                input_items = _build_context_token_aware(
-                    system_message=system_instructions,
-                    history_messages=history,
-                    new_user_text=text_for_model,
-                    budget_tokens=REQUEST_BUDGET,
-                    enc=enc,
+                input_items = build_thread_context(
+                    system_instructions,
+                    profile_blob=profile_blob,
+                    summary_text=summary_text,
+                    recent_messages=history,
+                    user_text=text_for_model,
                 )
                 if debug:
                     print(f"[debug] approx request tokens: {_count_tokens(input_items, enc)}")
@@ -663,20 +583,18 @@ def main():
                         call_tool_fn=call_tool,
                     )
                 except Exception as e:
-                    # If we still overflow the model's context window, retry with a smaller budget and no memory injection.
+                    # If we still overflow the model's context window, retry without memory injection.
                     if "context_length_exceeded" in str(e):
                         if debug:
-                            print("[debug] context_length_exceeded: retrying with reduced budget")
+                            print("[debug] context_length_exceeded: retrying without memory injection")
                         reduced_budget = max(4096, int(REQUEST_BUDGET * 0.6))
-                        input_items = _build_context_token_aware(
-                            system_message=(
-                                system_instructions
-                                + "\n\nNote: context was trimmed aggressively due to context window limits."
-                            ),
-                            history_messages=history[-10:],
-                            new_user_text=_truncate_text_to_tokens(text, max(256, reduced_budget // 4), enc),
-                            budget_tokens=reduced_budget,
-                            enc=enc,
+                        text_retry = _truncate_text_to_tokens(text, max(256, reduced_budget // 4), enc)
+                        input_items = build_thread_context(
+                            base_system_instructions + "\n\nNote: context was trimmed due to token limits.",
+                            profile_blob=profile_blob,
+                            summary_text=summary_text,
+                            recent_messages=history,
+                            user_text=text_retry,
                         )
                         final_text, tool_events, usage_stats = run_with_coordinator(
                             client=client,
@@ -745,6 +663,19 @@ def main():
                         )
                     except Exception:
                         pass
+
+                try:
+                    update_thread_summary(
+                        conn,
+                        client,
+                        MODEL,
+                        conversation_id=agent_convo,
+                        user_id=user_id,
+                        agent=agent,
+                        force=should_force_thread_summary(text),
+                    )
+                except Exception:
+                    pass
 
                 responses.append(f"[{display_agent}] {final_text}")
 

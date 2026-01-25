@@ -20,6 +20,20 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_convo_time
 ON messages(conversation_id, created_at);
 
+CREATE TABLE IF NOT EXISTS conversation_summaries (
+  conversation_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  agent TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  message_count INTEGER NOT NULL DEFAULT 0,
+  last_message_id TEXT,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_summaries_user_agent
+ON conversation_summaries(user_id, agent);
+
 CREATE TABLE IF NOT EXISTS reminders (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL,

@@ -41,6 +41,7 @@ WRITE_TOOLS: Set[str] = {
     "clone_repo",
     # existing
     "create_reminder",
+    "google_calendar_create_event",
     "ds_create_course",
     "ds_start_course",
     "ds_next_lesson",
@@ -57,6 +58,7 @@ NETWORK_TOOLS: Set[str] = {
     "web_search",
     "clinical_guideline_search",
     "clone_repo",
+    "google_calendar_create_event",
 }
 
 FS_WRITE_TOOLS: Set[str] = {

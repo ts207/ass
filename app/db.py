@@ -254,6 +254,77 @@ def get_recent_messages(conn: sqlite3.Connection, convo_id: str, max_messages: i
     rows = list(reversed(rows))
     return [{"role": r["role"], "content": r["content"]} for r in rows]
 
+def get_recent_thread_messages(conn: sqlite3.Connection, convo_id: str, max_messages: int) -> List[Dict[str, str]]:
+    rows = conn.execute(
+        "SELECT id, role, content FROM messages WHERE conversation_id=? AND role IN ('user','assistant') "
+        "ORDER BY created_at DESC LIMIT ?",
+        (convo_id, max_messages),
+    ).fetchall()
+    rows = list(reversed(rows))
+    return [{"id": r["id"], "role": r["role"], "content": r["content"]} for r in rows]
+
+def get_conversation_message_count(conn: sqlite3.Connection, convo_id: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS cnt FROM messages WHERE conversation_id=? AND role IN ('user','assistant')",
+        (convo_id,),
+    ).fetchone()
+    return int(row["cnt"] or 0) if row else 0
+
+def get_messages_after_offset(conn: sqlite3.Connection, convo_id: str, offset: int) -> List[Dict[str, Any]]:
+    off = max(0, int(offset or 0))
+    rows = conn.execute(
+        "SELECT id, role, content, created_at FROM messages "
+        "WHERE conversation_id=? AND role IN ('user','assistant') "
+        "ORDER BY created_at ASC LIMIT -1 OFFSET ?",
+        (convo_id, off),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+def get_conversation_summary(conn: sqlite3.Connection, conversation_id: str) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        "SELECT conversation_id, user_id, agent, summary, message_count, last_message_id, updated_at "
+        "FROM conversation_summaries WHERE conversation_id=?",
+        (conversation_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+def upsert_conversation_summary(
+    conn: sqlite3.Connection,
+    *,
+    conversation_id: str,
+    user_id: str,
+    agent: str,
+    summary: str,
+    message_count: int,
+    last_message_id: str | None,
+) -> None:
+    now = _now_iso()
+    conn.execute(
+        """
+        INSERT INTO conversation_summaries (
+          conversation_id, user_id, agent, summary, message_count, last_message_id, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(conversation_id) DO UPDATE SET
+          user_id=excluded.user_id,
+          agent=excluded.agent,
+          summary=excluded.summary,
+          message_count=excluded.message_count,
+          last_message_id=excluded.last_message_id,
+          updated_at=excluded.updated_at
+        """,
+        (
+            conversation_id,
+            user_id,
+            agent,
+            summary or "",
+            int(message_count or 0),
+            last_message_id,
+            now,
+        ),
+    )
+    conn.commit()
+
 def get_last_user_message_id(conn: sqlite3.Connection, convo_id: str) -> Optional[str]:
     row = conn.execute(
         "SELECT id FROM messages WHERE conversation_id=? AND role='user' "
@@ -637,6 +708,23 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_turn_router_decisions_turn "
         "ON turn_router_decisions(conversation_id, turn_id)"
+    )
+
+    # Thread summaries (per conversation)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS conversation_summaries ("
+        "conversation_id TEXT PRIMARY KEY, "
+        "user_id TEXT NOT NULL, "
+        "agent TEXT NOT NULL, "
+        "summary TEXT NOT NULL, "
+        "message_count INTEGER NOT NULL DEFAULT 0, "
+        "last_message_id TEXT, "
+        "updated_at TEXT NOT NULL, "
+        "FOREIGN KEY(conversation_id) REFERENCES conversations(id))"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_summaries_user_agent "
+        "ON conversation_summaries(user_id, agent)"
     )
 
     # Code progress table (kept for legacy logging)

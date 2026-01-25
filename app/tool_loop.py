@@ -386,6 +386,7 @@ def run_with_coordinator(
     tool_call_count = 0
     feedback = None
     tool_results = None
+    last_feedback = None
 
     perms = get_permissions(conn, user_id)
 
@@ -407,6 +408,19 @@ def run_with_coordinator(
         raw = _extract_final_text(response, output_items)
         if debug:
             print(f"[debug] specialist_raw={raw!r}")
+
+        if not isinstance(raw, str) or not raw.strip():
+            feedback = "Empty response. Return strict JSON only."
+            last_feedback = feedback
+            tool_results = None
+            continue
+
+        parsed = _extract_json_obj(raw)
+        if parsed is None:
+            feedback = "Invalid JSON. Return strict JSON only."
+            last_feedback = feedback
+            tool_results = None
+            continue
 
         payload = _normalize_specialist_payload(raw, task_id)
         result_text = payload.get("result") or ""
@@ -541,6 +555,13 @@ def run_with_coordinator(
 
         if tool_required and tool_call_count == 0:
             feedback = "Tool-required step: propose tool calls before completing."
+            last_feedback = feedback
+            tool_results = None
+            continue
+
+        if not proposed_calls and not result_text.strip() and not tool_required:
+            feedback = "Missing result. Return a non-empty result field in the JSON."
+            last_feedback = feedback
             tool_results = None
             continue
 
@@ -555,8 +576,9 @@ def run_with_coordinator(
             result_text = result_text + "\n\nArtifacts:\n" + "\n".join(artifacts)
         return result_text, tool_events, {"model": model, "tool_calls": tool_call_count, **usage_totals}
 
+    tail = f" {last_feedback}" if last_feedback else ""
     return (
-        "Error: coordinator exceeded max turns.",
+        f"Error: coordinator exceeded max turns.{tail}",
         tool_events,
         {"model": model, "tool_calls": tool_call_count, **usage_totals},
     )

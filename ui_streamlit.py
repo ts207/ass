@@ -26,9 +26,11 @@ from app.db import (
     add_message,
     create_conversation,
     get_user_profile,
+    get_conversation_summary,
     get_agent_conversation_id,
     set_agent_conversation_id,
     get_last_user_message_id,
+    get_recent_thread_messages,
     get_turn_memory_usage,
     record_turn_memory_usage,
     get_turn_tool_usage,
@@ -40,34 +42,14 @@ from app.db import (
 from app.tool_loop import run_with_coordinator, run_router
 from app.tool_runtime import call_tool
 from app.tool_schemas import LIFE_TOOLS, HEALTH_TOOLS, DS_TOOLS, CODE_TOOLS, GENERAL_TOOLS
-from app.token_utils import try_get_encoding, count_message_tokens, token_len, truncate_to_tokens
+from app.token_utils import try_get_encoding, truncate_to_tokens
+from app.thread_summary import build_thread_context, should_force_thread_summary, update_thread_summary
 
 load_dotenv()
 
 SCHEMA_PATH = Path("app/schema.sql")
 ENCODING = try_get_encoding()
 REQUEST_BUDGET = int(MODEL_CONTEXT_TOKENS * REQUEST_BUDGET_FRACTION)
-
-
-def _count_tokens(messages):
-    return count_message_tokens(messages, ENCODING)
-
-
-def _build_context_token_aware(system_message: str, history_messages, new_user_text: str, budget_tokens: int):
-    base = [{"role": "system", "content": system_message}]
-    acc_tokens = _count_tokens(base)
-    user_tokens = token_len("user", ENCODING) + token_len(new_user_text, ENCODING)
-    acc_tokens += user_tokens
-
-    selected = []
-    for m in reversed(history_messages):
-        t = token_len(m["role"], ENCODING) + token_len(m["content"], ENCODING)
-        if acc_tokens + t > budget_tokens:
-            break
-        selected.append({"role": m["role"], "content": m["content"]})
-        acc_tokens += t
-    selected.reverse()
-    return base + selected + [{"role": "user", "content": new_user_text}]
 
 
 def _truncate_text_to_tokens(text: str, max_tokens: int) -> str:
@@ -118,6 +100,11 @@ def _call_with_context_retry(
     agent: str,
     tool_required: bool,
     task_type: str | None,
+    base_system: str,
+    profile_blob: str,
+    summary_text: str,
+    recent_messages: list,
+    user_text: str,
 ):
     try:
         final_text, tool_events, usage_stats = run_with_coordinator(
@@ -138,19 +125,13 @@ def _call_with_context_retry(
         if "context_length_exceeded" not in str(e):
             raise
         reduced_budget = max(4096, int(REQUEST_BUDGET * 0.6))
-        history = get_recent_messages(conn, st.session_state.convo_id, 12)
-        base_system = ""
-        if input_items and input_items[0].get("role") == "system":
-            base_system = str(input_items[0].get("content") or "")
-        input_items = _build_context_token_aware(
-            system_message=(
-                base_system + "\n\nNote: context was trimmed due to token limits."
-                if base_system
-                else "Note: context was trimmed due to token limits."
-            ),
-            history_messages=history,
-            new_user_text=input_items[-1]["content"],
-            budget_tokens=reduced_budget,
+        text_retry = _truncate_text_to_tokens(user_text, max(256, reduced_budget // 4))
+        input_items = build_thread_context(
+            (base_system + "\n\nNote: context was trimmed due to token limits.") if base_system else "Note: context was trimmed due to token limits.",
+            profile_blob=profile_blob,
+            summary_text=summary_text,
+            recent_messages=recent_messages,
+            user_text=text_retry,
         )
         final_text, tool_events, usage_stats = run_with_coordinator(
             client=client,
@@ -425,6 +406,7 @@ if prompt:
             f"You are the Life Manager. User timezone: {tz}. "
             "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
             "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile. "
+            "If the user wants Google Calendar sync or device reminders, call google_calendar_create_event. "
             "If a tool errors due to permissions, ask the user to toggle Permissions in the sidebar."
             "\n\nMemory policy: If the user references past context or asks for personalization/continuation, call memory_search_graph before answering. "
             "Use k=5 candidate_limit=250 context_up=4 context_down=2. "
@@ -436,6 +418,7 @@ if prompt:
             "You are not a doctor; give general, evidence-based guidance and encourage professional help for urgent symptoms. "
             "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
             "If the user explicitly asks to save/update stable facts (timezone, conditions, meds, preferences, goals), call set_profile. "
+            "If the user wants Google Calendar sync or device reminders, call google_calendar_create_event. "
             "If a tool errors due to permissions, ask the user to toggle Permissions in the sidebar."
             "\n\nMemory policy: If the user references past symptoms, treatments, labs, routines, or asks to continue a plan, call memory_search_graph before answering. "
             "Use k=5 candidate_limit=250 context_up=4 context_down=2. "
@@ -469,19 +452,16 @@ if prompt:
             "DS query format: <topic> <error/problem> <library/tool> <outcome/goal>."
         )
 
+    base_system_instructions = system_instructions
+    profile_blob = ""
     if profile:
         profile_blob = json.dumps(profile, ensure_ascii=False, indent=2)
         profile_blob = _truncate_text_to_tokens(profile_blob, PROFILE_INJECT_MAX_TOKENS)
-        if profile_blob:
-            system_instructions = (
-                system_instructions
-                + "\n\nUser profile (stable facts, user-provided). Use as ground truth; do not invent missing fields:\n"
-                + profile_blob
-            )
 
     mem_results = []
     mem_debug = None
     mem_search_ran = False
+    system_instructions = base_system_instructions
     try:
         from app.tools import memory_search_graph_tool
 
@@ -531,11 +511,15 @@ if prompt:
     max_user_tokens = max(256, REQUEST_BUDGET // 4)
     prompt_for_model = _truncate_text_to_tokens(prompt, max_user_tokens)
 
-    input_items = _build_context_token_aware(
-        system_message=system_instructions,
-        history_messages=history,
-        new_user_text=prompt_for_model,
-        budget_tokens=REQUEST_BUDGET,
+    summary_row = get_conversation_summary(conn, st.session_state.convo_id)
+    summary_text = summary_row["summary"] if summary_row else ""
+    recent_messages = get_recent_thread_messages(conn, st.session_state.convo_id, 20)
+    input_items = build_thread_context(
+        system_instructions,
+        profile_blob=profile_blob,
+        summary_text=summary_text,
+        recent_messages=recent_messages,
+        user_text=prompt_for_model,
     )
 
     router_decision = {
@@ -569,6 +553,11 @@ if prompt:
         agent=agent,
         tool_required=tool_required,
         task_type=task_type,
+        base_system=base_system_instructions,
+        profile_blob=profile_blob,
+        summary_text=summary_text,
+        recent_messages=recent_messages,
+        user_text=prompt,
     )
 
     user_msg_id = add_message(conn, st.session_state.convo_id, "user", prompt)
@@ -621,6 +610,19 @@ if prompt:
             )
         except Exception:
             pass
+
+    try:
+        update_thread_summary(
+            conn,
+            client,
+            MODEL,
+            conversation_id=st.session_state.convo_id,
+            user_id=user_id,
+            agent=agent,
+            force=should_force_thread_summary(prompt),
+        )
+    except Exception:
+        pass
 
     with st.chat_message("assistant"):
         st.markdown(final_text or "")

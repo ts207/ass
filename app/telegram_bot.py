@@ -6,6 +6,7 @@ Lightweight Telegram bridge for the assistant.
 """
 
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
@@ -33,8 +34,6 @@ from app.config import (
     PROFILE_INJECT_MAX_TOKENS,
 )
 from app.chat import (
-    _build_context_token_aware,
-    _ensure_budget_with_summary,
     _format_memory_results,
     _get_encoding,
     _should_retrieve_memory,
@@ -46,7 +45,9 @@ from app.db import (
     add_message,
     connect,
     create_conversation,
+    get_conversation_summary,
     get_agent_conversation_id,
+    get_recent_thread_messages,
     get_user_profile,
     init_db,
     run_migrations,
@@ -62,6 +63,7 @@ from app.tool_schemas import GENERAL_TOOLS
 from app.tools import memory_search_graph_tool
 from app.tools_general import delegate_agent
 from app.tools_permissions import get_permissions
+from app.thread_summary import build_thread_context, should_force_thread_summary, update_thread_summary
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -152,20 +154,6 @@ def _general_system_instructions(profile: Dict[str, str]) -> str:
         f"User timezone: {tz}."
     )
 
-    if profile:
-        try:
-            import json
-
-            profile_blob = json.dumps(profile, ensure_ascii=False, indent=2)
-            profile_blob = _truncate_text_to_tokens(profile_blob, PROFILE_INJECT_MAX_TOKENS, ENCODING)
-            if profile_blob:
-                system_instructions += (
-                    "\n\nUser profile (stable facts, user-provided). Use as ground truth; do not invent missing fields:\n"
-                    + profile_blob
-                )
-        except Exception:
-            pass
-
     return system_instructions
 
 
@@ -179,10 +167,16 @@ def _run_general_agent(conn, *, user_id: str, text: str, debug: bool = False) ->
     client = _get_openai_client()
     profile = get_user_profile(conn, user_id)
     system_instructions = _general_system_instructions(profile or {})
+    base_system_instructions = system_instructions
+    profile_blob = ""
+    if profile:
+        profile_blob = json.dumps(profile, ensure_ascii=False, indent=2)
+        profile_blob = _truncate_text_to_tokens(profile_blob, PROFILE_INJECT_MAX_TOKENS, ENCODING)
 
     mem_results: List[Dict[str, str]] = []
     mem_debug = None
     mem_search_ran = False
+    system_instructions = base_system_instructions
     try:
         allow_network = False
         try:
@@ -226,26 +220,19 @@ def _run_general_agent(conn, *, user_id: str, text: str, debug: bool = False) ->
         if debug:
             logger.warning("memory injection failed: %s", e)
 
-    history = _ensure_budget_with_summary(
-        conn,
-        client,
-        MODEL,
-        agent_convo,
-        system_instructions,
-        REQUEST_BUDGET,
-        ENCODING,
-        user_id,
-    )
+    summary_row = get_conversation_summary(conn, agent_convo)
+    summary_text = summary_row["summary"] if summary_row else ""
+    history = get_recent_thread_messages(conn, agent_convo, 20)
 
     max_user_tokens = max(256, REQUEST_BUDGET // 4)
     text_for_model = _truncate_text_to_tokens(text, max_user_tokens, ENCODING)
 
-    input_items = _build_context_token_aware(
-        system_message=system_instructions,
-        history_messages=history,
-        new_user_text=text_for_model,
-        budget_tokens=REQUEST_BUDGET,
-        enc=ENCODING,
+    input_items = build_thread_context(
+        system_instructions,
+        profile_blob=profile_blob,
+        summary_text=summary_text,
+        recent_messages=history,
+        user_text=text_for_model,
     )
 
     router_decision = {
@@ -289,12 +276,13 @@ def _run_general_agent(conn, *, user_id: str, text: str, debug: bool = False) ->
     except Exception as e:
         if "context_length_exceeded" in str(e):
             reduced_budget = max(4096, int(REQUEST_BUDGET * 0.6))
-            input_items = _build_context_token_aware(
-                system_message=system_instructions + "\n\nNote: context was trimmed due to token limits.",
-                history_messages=history[-10:],
-                new_user_text=_truncate_text_to_tokens(text, max(256, reduced_budget // 4), ENCODING),
-                budget_tokens=reduced_budget,
-                enc=ENCODING,
+            text_retry = _truncate_text_to_tokens(text, max(256, reduced_budget // 4), ENCODING)
+            input_items = build_thread_context(
+                base_system_instructions + "\n\nNote: context was trimmed due to token limits.",
+                profile_blob=profile_blob,
+                summary_text=summary_text,
+                recent_messages=history,
+                user_text=text_retry,
             )
             final_text, tool_events, usage_stats = run_with_coordinator(
                 client=client,
@@ -362,6 +350,19 @@ def _run_general_agent(conn, *, user_id: str, text: str, debug: bool = False) ->
             )
         except Exception:
             pass
+
+    try:
+        update_thread_summary(
+            conn,
+            client,
+            MODEL,
+            conversation_id=agent_convo,
+            user_id=user_id,
+            agent=agent,
+            force=should_force_thread_summary(text),
+        )
+    except Exception:
+        pass
 
     return final_text
 

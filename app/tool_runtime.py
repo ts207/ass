@@ -183,6 +183,14 @@ def call_tool(name: str, args: Dict[str, Any], *, conn, user_id: str, agent: str
                 rrule=args.get("rrule"),
                 channels=args.get("channels"),
             )
+        elif name == "google_calendar_create_event":
+            out = t.google_calendar_create_event(
+                title=args["title"],
+                due_at=args["due_at"],
+                notes=args.get("notes"),
+                duration_minutes=args.get("duration_minutes"),
+                reminder_minutes=args.get("reminder_minutes"),
+            )
         elif name == "list_reminders":
             out = t.list_reminders(conn, user_id=user_id, limit=int(args.get("limit", 10)))
         elif name == "create_event":

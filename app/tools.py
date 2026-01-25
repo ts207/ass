@@ -33,6 +33,7 @@ from app.tools_life import (
     estimate_travel_time,
     update_event,
 )
+from app.tools_gcal import google_calendar_create_event
 from app.tools_health import (
     clinical_guideline_search,
     create_appointment,
@@ -90,6 +91,7 @@ __all__ = [
     "audit_log_list",
     "create_reminder",
     "list_reminders",
+    "google_calendar_create_event",
     "create_event",
     "update_event",
     "delete_event",

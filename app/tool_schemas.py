@@ -172,7 +172,7 @@ delegate_agent = {
             "agent": {"type": "string", "enum": ["life", "health", "ds", "code"]},
             "task": {"type": "string"},
             "include_history": {"type": "boolean", "default": True},
-            "history_limit": {"type": "integer", "default": 12, "minimum": 0, "maximum": 50},
+            "history_limit": {"type": "integer", "default": 20, "minimum": 0, "maximum": 50},
         },
         "required": ["agent", "task"],
     },
@@ -212,6 +212,26 @@ list_reminders = {
             "limit": {"type": "integer", "default": 10, "minimum": 1, "maximum": 50},
         },
         "required": [],
+    },
+}
+
+google_calendar_create_event = {
+    "type": "function",
+    "name": "google_calendar_create_event",
+    "description": "Create a Google Calendar event in the user's primary calendar (network + OAuth required).",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "due_at": {
+                "type": "string",
+                "description": "ISO 8601 datetime with timezone offset (e.g. 2025-12-31T09:00:00+01:00).",
+            },
+            "notes": {"type": "string"},
+            "duration_minutes": {"type": "integer", "default": 30, "minimum": 1, "maximum": 1440},
+            "reminder_minutes": {"type": "integer", "minimum": 0, "maximum": 10080},
+        },
+        "required": ["title", "due_at"],
     },
 }
 
@@ -934,6 +954,7 @@ LIFE_TOOLS = [
     list_tasks,
     create_reminder,
     list_reminders,
+    google_calendar_create_event,
     add_contact,
     get_contact,
     convert_timezone,
@@ -976,6 +997,7 @@ HEALTH_TOOLS = [
     delete_event,
     list_events,
     free_busy,
+    google_calendar_create_event,
     memory_search_graph,
     set_profile,
 ]

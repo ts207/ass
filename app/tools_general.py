@@ -14,13 +14,15 @@ from app.db import (
     add_message,
     create_conversation,
     get_agent_conversation_id,
-    get_recent_messages,
+    get_conversation_summary,
+    get_recent_thread_messages,
     get_user_profile,
     set_agent_conversation_id,
     record_turn_tool_usage,
     record_turn_token_usage,
     record_turn_router_decision,
 )
+from app.thread_summary import build_thread_context, should_force_thread_summary, update_thread_summary
 
 
 def fetch_url(url: str) -> Dict[str, Any]:
@@ -111,6 +113,7 @@ def _agent_system_instructions(agent: str, tz: str) -> str:
             "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
             "If a tool errors due to permissions, explain what must be enabled. "
             "If the user explicitly asks to save/update stable facts (timezone, preferences, goals), call set_profile."
+            "If the user wants Google Calendar sync or device reminders, call google_calendar_create_event."
             "\n\nMemory policy: If the user references past context or asks for personalization/continuation, call memory_search_graph before answering. "
             "Use k=5 candidate_limit=250 context_up=4 context_down=2. "
             "Life query format: <goal/symptom> <routine> <constraint> <timeframe> (use discriminative nouns)."
@@ -123,6 +126,7 @@ def _agent_system_instructions(agent: str, tz: str) -> str:
             "If you schedule reminders, always output due_at as ISO 8601 with timezone offset. "
             "If a tool errors due to permissions, explain what must be enabled. "
             "If the user explicitly asks to save/update stable facts (timezone, conditions, meds, preferences, goals), call set_profile."
+            "If the user wants Google Calendar sync or device reminders, call google_calendar_create_event."
             "\n\nMemory policy: If the user references past symptoms, treatments, labs, routines, or asks to continue a plan, call memory_search_graph before answering. "
             "Use k=5 candidate_limit=250 context_up=4 context_down=2. "
             "Health query format: <symptom/goal> <med/supplement/routine> <constraint> <timeframe>."
@@ -157,7 +161,7 @@ def delegate_agent(
     task: str,
     call_tool_fn,
     include_history: bool = True,
-    history_limit: int = 12,
+    history_limit: int = 20,
 ) -> Dict[str, Any]:
     agent_val = (agent or "").strip().lower()
     if agent_val not in ("life", "health", "ds", "code"):
@@ -178,17 +182,12 @@ def delegate_agent(
         tz = "Asia/Ulaanbaatar"
 
     system_instructions = _agent_system_instructions(agent_val, tz)
-
+    base_system_instructions = system_instructions
+    profile_blob = ""
     if profile:
         enc = try_get_encoding()
         profile_blob = json.dumps(profile, ensure_ascii=False, indent=2)
         profile_blob = truncate_to_tokens(profile_blob, PROFILE_INJECT_MAX_TOKENS, enc)
-        if profile_blob:
-            system_instructions = (
-                system_instructions
-                + "\n\nUser profile (stable facts, user-provided). Use as ground truth; do not invent missing fields:\n"
-                + profile_blob
-            )
 
     agent_convo = get_agent_conversation_id(conn, user_id, agent_val)
     if not agent_convo:
@@ -196,13 +195,20 @@ def delegate_agent(
         set_agent_conversation_id(conn, user_id, agent_val, agent_convo)
 
     history_msgs: List[Dict[str, Any]] = []
-    lim = max(0, min(int(history_limit or 0), 50))
+    lim = max(0, min(int(history_limit or 0), 20))
     if include_history and lim > 0:
-        history_msgs = get_recent_messages(conn, agent_convo, lim)
+        history_msgs = get_recent_thread_messages(conn, agent_convo, lim)
 
-    input_items = [{"role": "system", "content": system_instructions}]
-    input_items.extend(history_msgs)
-    input_items.append({"role": "user", "content": text})
+    summary_row = get_conversation_summary(conn, agent_convo)
+    summary_text = summary_row["summary"] if summary_row else ""
+
+    input_items = build_thread_context(
+        system_instructions,
+        profile_blob=profile_blob,
+        summary_text=summary_text,
+        recent_messages=history_msgs,
+        user_text=text,
+    )
 
     client = _get_openai_client()
     tools_schema = _agent_tools_schema(agent_val)
@@ -246,11 +252,18 @@ def delegate_agent(
         )
     except Exception as e:
         if "context_length_exceeded" in str(e) and history_msgs:
+            trimmed_items = build_thread_context(
+                base_system_instructions + "\n\nNote: context was trimmed due to token limits.",
+                profile_blob=profile_blob,
+                summary_text=summary_text,
+                recent_messages=[],
+                user_text=text,
+            )
             final_text, tool_events, usage_stats = run_with_coordinator(
                 client=client,
                 model=MODEL,
                 tools_schema=tools_schema,
-                input_items=[{"role": "system", "content": system_instructions}, {"role": "user", "content": text}],
+                input_items=trimmed_items,
                 conn=conn,
                 user_id=user_id,
                 agent=agent_val,
@@ -297,6 +310,19 @@ def delegate_agent(
             completion_tokens=usage_stats.get("completion_tokens"),
             total_tokens=usage_stats.get("total_tokens"),
             tool_calls=usage_stats.get("tool_calls"),
+        )
+    except Exception:
+        pass
+
+    try:
+        update_thread_summary(
+            conn,
+            client,
+            MODEL,
+            conversation_id=agent_convo,
+            user_id=user_id,
+            agent=agent_val,
+            force=should_force_thread_summary(text),
         )
     except Exception:
         pass

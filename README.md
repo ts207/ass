@@ -219,6 +219,39 @@ python scripts/analyze_export.py \
   --outdir data/exports/run_001
 ```
 
+## Google Calendar (One-Way Sync to Primary)
+
+This integration lets the assistant create Google Calendar events so reminders show up on your phone.
+
+1) Create OAuth credentials in Google Cloud Console (Desktop app) and download `credentials.json`.
+2) Set env vars:
+
+```env
+GOOGLE_CALENDAR_CLIENT_SECRETS=/mnt/c/Users/<you>/Downloads/credentials.json
+# Optional (default: data/google_calendar_token.json)
+GOOGLE_CALENDAR_TOKEN_PATH=/mnt/c/Users/<you>/AppData/Local/ass/google_calendar_token.json
+```
+
+3) Enable permissions and use the tool:
+
+```text
+/perm write
+/perm net on
+life: google_calendar_create_event {"title":"Pay rent","due_at":"2026-02-01T09:00:00-08:00","reminder_minutes":30}
+```
+
+The first call opens a browser for OAuth, then stores a token locally. Events land in your **primary** Google Calendar.
+
+### Optional: Auto-sync reminders
+
+If you want every `create_reminder` to also create a Google Calendar event, set:
+
+```env
+GOOGLE_CALENDAR_AUTO_SYNC=true
+```
+
+When enabled, `create_reminder` returns a `google_calendar` field with the event link or an error if sync failed.
+
 Outputs are written under `data/exports/run_001/`:
 
 - `normalized/`: `conversations.parquet`, `messages.parquet`

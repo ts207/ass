@@ -18,6 +18,7 @@ from app.tools_core import (
     _safe_resolve,
     _to_utc_iso,
 )
+from app.tools_gcal import maybe_sync_reminder_to_google_calendar
 
 
 def create_reminder(
@@ -44,12 +45,18 @@ def create_reminder(
         (rid, user_id, title, due_at, due_at_utc, rrule, channels_json, notes or "", now, now),
     )
     conn.commit()
+    gcal = maybe_sync_reminder_to_google_calendar(
+        title=title,
+        due_at=due_at,
+        notes=notes,
+    )
     return {
         "id": rid,
         "title": title,
         "due_at": due_at,
         "due_at_utc": due_at_utc,
         "channels": channels or [],
+        "google_calendar": gcal,
     }
 
 
